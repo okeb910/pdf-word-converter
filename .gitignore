@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.env
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local test / conversion outputs (keep source samples if you add an examples/ folder)
+*_converted.docx
+*_converted.pdf
+*.tmp
+
+# Optional: ignore ad-hoc local test PDFs at repo root (rename/move to examples/ if you want them tracked)
+# _test_original.pdf
