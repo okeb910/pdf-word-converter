@@ -59,31 +59,43 @@ def _get_lo_path():
     return _LO_PATH
 
 def _check_libreoffice_available():
-    """检测 LibreOffice 是否可用（需要先手动运行一次 LO 完成初始化）"""
+    """用隔离的临时配置检测 LibreOffice 无头模式。"""
+    import tempfile
+
     lo = _get_lo_path()
     if not lo:
         return False
-    lo_dir = os.path.dirname(lo)
+    lo_dir = os.path.dirname(lo) or None
     try:
-        # 用 --headless 模式检测，确保能找到依赖库
-        result = subprocess.run(
-            [lo, "--headless", "--terminate_after_init"],
-            capture_output=True, text=True, timeout=15,
-            cwd=lo_dir,
-        )
-        # LO 26.x 返回码可能非零但库已初始化
-        # 检查是否有 "platform independent libraries" 错误
-        if "platform independent libraries" in (result.stderr or ""):
-            return False
-        return True
+        with tempfile.TemporaryDirectory(prefix="pdf_word_converter_detect_") as profile_dir:
+            profile_arg = f"-env:UserInstallation={Path(profile_dir).as_uri()}"
+            result = subprocess.run(
+                [lo, profile_arg, "--headless", "--terminate_after_init"],
+                capture_output=True, text=True, timeout=20,
+                cwd=lo_dir,
+            )
+        return result.returncode == 0
     except Exception:
         return False
 
 
-def _check_pymupdf_available():
-    """检测 PyMuPDF 是否可用"""
+def _load_pymupdf():
+    """兼容 PyMuPDF 新旧模块名，并确认核心 API 存在。"""
     try:
+        import pymupdf
+        module = pymupdf
+    except ImportError:
         import fitz
+        module = fitz
+    if not hasattr(module, "open"):
+        raise ImportError("PyMuPDF 模块缺少 open()，请重新安装 PyMuPDF")
+    return module
+
+
+def _check_pymupdf_available():
+    """检测 PyMuPDF 是否可用。"""
+    try:
+        _load_pymupdf()
         return True
     except ImportError:
         return False
@@ -205,7 +217,7 @@ def pdf_to_word_via_images(pdf_path: str, docx_path: str, progress, dpi: int = 3
     [高保真观感] 每页 PDF 渲染为高清图片嵌入 DOCX
     视觉上通常非常接近原 PDF；文字一般不可编辑、不可检索。
     """
-    import fitz
+    fitz = _load_pymupdf()
     from docx import Document
     from docx.shared import Inches, Cm
     from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -261,7 +273,10 @@ def pdf_to_word_via_images(pdf_path: str, docx_path: str, progress, dpi: int = 3
 
 
 def pdf_to_word_via_libreoffice(pdf_path: str, docx_path: str, progress) -> None:
-    """通过 LibreOffice 无头模式转换"""
+    """通过 LibreOffice 无头模式转换。"""
+    import shutil
+    import tempfile
+
     lo = _get_lo_path()
     if not lo:
         raise RuntimeError(
@@ -269,52 +284,55 @@ def pdf_to_word_via_libreoffice(pdf_path: str, docx_path: str, progress) -> None
             "下载: https://www.libreoffice.org/download/"
         )
     progress("正在通过 LibreOffice 转换...", 10)
-    out_dir = Path(docx_path).parent
-    lo_dir = os.path.dirname(lo)
-    lo_home = os.path.dirname(lo_dir)  # LO 安装根目录
+    lo_dir = os.path.dirname(lo) or None
 
-    # 设置环境变量确保 LO 找到依赖库
-    env = os.environ.copy()
-    env["URE_BOOTSTRAP"] = f"file:///{lo_dir}/fundamental.ini"
-    env["UNO_PATH"] = lo_dir
-    # 将 LO 程序目录加入 PATH 以便加载 DLL
-    env["PATH"] = f"{lo_dir};{lo_home}/share;{env.get('PATH', '')}"
-
-    result = subprocess.run(
-        [
-            lo, "--headless", "--convert-to", "docx",
-            "--outdir", str(out_dir), str(pdf_path),
-        ],
-        capture_output=True, text=True, timeout=300,
-        cwd=lo_dir, env=env,
-    )
-    if result.returncode != 0:
-        hint = ""
-        if "platform independent libraries" in result.stderr:
-            hint = (
-                "\n\nLibreOffice 26.x 存在初始化问题。请尝试："
-                "\n  1. 以管理员身份运行 LibreOffice 一次"
-                "\n  2. 或安装 LibreOffice 24.x 稳定版"
-            )
-        raise RuntimeError(
-            f"LibreOffice 转换失败。\n"
-            f"路径: {lo}\n"
-            f"错误信息: {result.stderr}{hint}"
+    with tempfile.TemporaryDirectory(prefix="pdf_word_converter_") as temp_root:
+        temp_root_path = Path(temp_root)
+        temp_output_dir = temp_root_path / "output"
+        profile_dir = temp_root_path / "profile"
+        temp_output_dir.mkdir()
+        profile_dir.mkdir()
+        profile_arg = f"-env:UserInstallation={profile_dir.as_uri()}"
+        result = subprocess.run(
+            [
+                lo, profile_arg, "--headless", "--convert-to", "docx",
+                "--outdir", str(temp_output_dir), str(pdf_path),
+            ],
+            capture_output=True, text=True, timeout=300,
+            cwd=lo_dir,
         )
-    # LO 生成的文件名可能与预期不同，查找实际输出
-    lo_output = Path(out_dir) / (Path(pdf_path).stem + ".docx")
-    if not lo_output.exists():
-        # LO 可能用了不同的文件名
-        for f in Path(out_dir).glob("*.docx"):
-            if f.stem.startswith(Path(pdf_path).stem):
-                lo_output = f
-                break
-    if lo_output != Path(docx_path) and lo_output.exists():
-        import shutil
-        if Path(docx_path).exists():
-            Path(docx_path).unlink()
-        shutil.move(str(lo_output), str(docx_path))
+        _raise_for_libreoffice_error(result, lo)
+        generated = _find_libreoffice_output(
+            temp_output_dir, Path(pdf_path).stem, ".docx"
+        )
+        shutil.move(str(generated), str(docx_path))
     progress("完成", 100)
+
+
+def _raise_for_libreoffice_error(result, lo_path) -> None:
+    stdout = getattr(result, "stdout", "") or ""
+    stderr = getattr(result, "stderr", "") or ""
+    combined_output = "\n".join(
+        part.strip() for part in (stdout, stderr) if part.strip()
+    )
+    if result.returncode == 0 and "Error:" not in combined_output:
+        return
+    details = combined_output or f"LibreOffice 返回码 {result.returncode}，未提供详细信息"
+    raise RuntimeError(
+        f"LibreOffice 转换失败。\n"
+        f"路径: {lo_path}\n"
+        f"错误信息: {details}"
+    )
+
+
+def _find_libreoffice_output(temp_dir, source_stem, suffix) -> Path:
+    expected = Path(temp_dir) / f"{source_stem}{suffix}"
+    if expected.is_file():
+        return expected
+    candidates = list(Path(temp_dir).glob(f"*{suffix}"))
+    if len(candidates) == 1:
+        return candidates[0]
+    raise RuntimeError("LibreOffice 未生成预期的输出文件")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -344,7 +362,10 @@ def docx_to_pdf_via_word(docx_path: str, pdf_path: str, progress) -> None:
 
 
 def docx_to_pdf_via_libreoffice(docx_path: str, pdf_path: str, progress) -> None:
-    """通过 LibreOffice 导出 PDF"""
+    """通过 LibreOffice 导出 PDF。"""
+    import shutil
+    import tempfile
+
     lo = _get_lo_path()
     if not lo:
         raise RuntimeError(
@@ -352,36 +373,28 @@ def docx_to_pdf_via_libreoffice(docx_path: str, pdf_path: str, progress) -> None
             "下载: https://www.libreoffice.org/download/"
         )
     progress("正在通过 LibreOffice 导出...", 10)
-    out_dir = Path(pdf_path).parent
-    lo_dir = os.path.dirname(lo)
-    lo_home = os.path.dirname(lo_dir)
+    lo_dir = os.path.dirname(lo) or None
 
-    env = os.environ.copy()
-    env["URE_BOOTSTRAP"] = f"file:///{lo_dir}/fundamental.ini"
-    env["UNO_PATH"] = lo_dir
-    env["PATH"] = f"{lo_dir};{lo_home}/share;{env.get('PATH', '')}"
-
-    result = subprocess.run(
-        [
-            lo, "--headless", "--convert-to", "pdf",
-            "--outdir", str(out_dir), str(docx_path),
-        ],
-        capture_output=True, text=True, timeout=120,
-        cwd=lo_dir, env=env,
-    )
-    if result.returncode != 0:
-        hint = ""
-        if "platform independent libraries" in result.stderr:
-            hint = (
-                "\n\nLibreOffice 26.x 存在初始化问题。请尝试："
-                "\n  1. 以管理员身份运行 LibreOffice 一次"
-                "\n  2. 或安装 LibreOffice 24.x 稳定版"
-            )
-        raise RuntimeError(
-            f"LibreOffice 转换失败。\n"
-            f"路径: {lo}\n"
-            f"错误信息: {result.stderr}{hint}"
+    with tempfile.TemporaryDirectory(prefix="pdf_word_converter_") as temp_root:
+        temp_root_path = Path(temp_root)
+        temp_output_dir = temp_root_path / "output"
+        profile_dir = temp_root_path / "profile"
+        temp_output_dir.mkdir()
+        profile_dir.mkdir()
+        profile_arg = f"-env:UserInstallation={profile_dir.as_uri()}"
+        result = subprocess.run(
+            [
+                lo, profile_arg, "--headless", "--convert-to", "pdf",
+                "--outdir", str(temp_output_dir), str(docx_path),
+            ],
+            capture_output=True, text=True, timeout=120,
+            cwd=lo_dir,
         )
+        _raise_for_libreoffice_error(result, lo)
+        generated = _find_libreoffice_output(
+            temp_output_dir, Path(docx_path).stem, ".pdf"
+        )
+        shutil.move(str(generated), str(pdf_path))
     progress("完成", 100)
 
 
@@ -517,350 +530,604 @@ def fix_converted_docx(docx_path: str, progress=None) -> None:
 #  GUI 界面
 # ═══════════════════════════════════════════════════════════
 
+from batch_logic import BatchResult, deduplicate_paths, run_conversion_batch
+
+
 class ConverterApp:
+    STATUS_TEXT = {
+        "pending": "等待",
+        "running": "转换中",
+        "success": "成功",
+        "failed": "失败",
+        "cancelled": "已取消",
+    }
+
     def __init__(self, root):
         self.root = root
-        self.root.title("PDF ↔ Word 转换工具（本地）")
-        self.root.geometry("640x620")
-        self.root.resizable(False, False)
+        self.root.title("PDF ↔ Word 批量转换工具（本地）")
+        self.root.geometry("900x760")
+        self.root.minsize(780, 680)
+        self.root.resizable(True, True)
         self.root.configure(bg="#f5f5f5")
 
-        self.file_path = None
-        self.output_path = None
-        self._avail_methods = {}  # 存储每个方法的可用状态
-        self._method_widgets = {}  # 存储 RadioButton 引用
+        self.input_paths = []
+        self.batch_extension = None
+        self.output_paths = []
+        self._tree_paths = {}
+        self._avail_methods = {}
+        self._method_widgets = {}
+        self._engine_detection_complete = False
+        self._is_converting = False
+        self._cancel_event = threading.Event()
         self._setup_ui()
         self._detect_engines()
 
     def _setup_ui(self):
-        # ── 标题 ──
         title = tk.Label(
-            self.root, text="PDF ↔ Word 转换工具",
+            self.root, text="PDF ↔ Word 批量转换工具",
             font=("Microsoft YaHei", 18, "bold"), bg="#f5f5f5", fg="#222",
         )
-        title.pack(pady=(20, 5))
+        title.pack(pady=(16, 4))
 
         tk.Label(
-            self.root, text="本地转换 · 优先本机 Word · 可选图片保真 / LibreOffice",
-            font=("Microsoft YaHei", 10), bg="#f5f5f5", fg="#888",
-        ).pack(pady=(0, 18))
+            self.root, text="本地串行转换 · 支持批量队列 · 文件不会上传",
+            font=("Microsoft YaHei", 10), bg="#f5f5f5", fg="#666",
+        ).pack(pady=(0, 12))
 
-        # ── 文件选择 ──
         file_frame = tk.LabelFrame(
-            self.root, text=" 选择文件 ", font=("Microsoft YaHei", 10),
-            bg="#f5f5f5", fg="#333", padx=12, pady=10,
+            self.root, text=" 转换队列 ", font=("Microsoft YaHei", 10),
+            bg="#f5f5f5", fg="#333", padx=10, pady=8,
         )
-        file_frame.pack(padx=30, fill="x")
+        file_frame.pack(padx=24, fill="both")
 
-        btn_row = tk.Frame(file_frame, bg="#f5f5f5")
-        btn_row.pack(fill="x")
+        button_row = tk.Frame(file_frame, bg="#f5f5f5")
+        button_row.pack(fill="x", pady=(0, 7))
 
         self.select_pdf_btn = tk.Button(
-            btn_row, text="选择 PDF → Word", font=("Microsoft YaHei", 10),
-            width=17, command=lambda: self.select_file("pdf"),
-            bg="#e74c3c", fg="white", activebackground="#c0392b", cursor="hand2",
+            button_row, text="添加 PDF", font=("Microsoft YaHei", 10),
+            width=13, command=lambda: self.select_files(".pdf"),
+            bg="#c0392b", fg="white", activebackground="#a93226", cursor="hand2",
         )
-        self.select_pdf_btn.pack(side="left", padx=(0, 8))
+        self.select_pdf_btn.pack(side="left", padx=(0, 7))
 
         self.select_docx_btn = tk.Button(
-            btn_row, text="选择 Word → PDF", font=("Microsoft YaHei", 10),
-            width=17, command=lambda: self.select_file("docx"),
-            bg="#2980b9", fg="white", activebackground="#1a5276", cursor="hand2",
+            button_row, text="添加 Word", font=("Microsoft YaHei", 10),
+            width=13, command=lambda: self.select_files(".docx"),
+            bg="#2471a3", fg="white", activebackground="#1f618d", cursor="hand2",
         )
-        self.select_docx_btn.pack(side="left")
+        self.select_docx_btn.pack(side="left", padx=(0, 7))
 
-        self.path_var = tk.StringVar(value="尚未选择文件")
-        path_entry = tk.Entry(
-            file_frame, textvariable=self.path_var, font=("Consolas", 9),
-            state="readonly", readonlybackground="white",
+        self.remove_btn = tk.Button(
+            button_row, text="移除选中", font=("Microsoft YaHei", 9),
+            width=11, command=self.remove_selected,
         )
-        path_entry.pack(fill="x", pady=(10, 0))
+        self.remove_btn.pack(side="left", padx=(8, 5))
 
-        # ── PDF → Word 转换方式 ──
+        self.clear_btn = tk.Button(
+            button_row, text="清空", font=("Microsoft YaHei", 9),
+            width=8, command=self.clear_queue,
+        )
+        self.clear_btn.pack(side="left")
+
+        self.queue_summary_var = tk.StringVar(value="尚未添加文件")
+        tk.Label(
+            button_row, textvariable=self.queue_summary_var,
+            font=("Microsoft YaHei", 9), bg="#f5f5f5", fg="#555",
+        ).pack(side="right")
+
+        tree_frame = tk.Frame(file_frame, bg="#f5f5f5")
+        tree_frame.pack(fill="both", expand=True)
+        columns = ("name", "folder", "status", "output")
+        self.file_tree = ttk.Treeview(
+            tree_frame, columns=columns, show="headings", height=6,
+            selectmode="extended",
+        )
+        self.file_tree.heading("name", text="文件名")
+        self.file_tree.heading("folder", text="来源目录")
+        self.file_tree.heading("status", text="状态")
+        self.file_tree.heading("output", text="输出文件")
+        self.file_tree.column("name", width=180, minwidth=120, stretch=False)
+        self.file_tree.column("folder", width=250, minwidth=140, stretch=True)
+        self.file_tree.column("status", width=75, minwidth=70, stretch=False, anchor="center")
+        self.file_tree.column("output", width=260, minwidth=160, stretch=True)
+        self.file_tree.tag_configure("success", foreground="#18794e")
+        self.file_tree.tag_configure("failed", foreground="#b42318")
+        self.file_tree.tag_configure("cancelled", foreground="#777")
+        tree_scroll = ttk.Scrollbar(tree_frame, command=self.file_tree.yview)
+        self.file_tree.configure(yscrollcommand=tree_scroll.set)
+        tree_scroll.pack(side="right", fill="y")
+        self.file_tree.pack(side="left", fill="both", expand=True)
+        self.file_tree.bind("<<TreeviewSelect>>", lambda _event: self._update_action_states())
+
+        output_frame = tk.LabelFrame(
+            self.root, text=" 输出位置 ", font=("Microsoft YaHei", 10),
+            bg="#f5f5f5", fg="#333", padx=10, pady=8,
+        )
+        output_frame.pack(padx=24, pady=(10, 0), fill="x")
+
+        self.output_mode_var = tk.StringVar(value="source")
+        self.source_output_radio = tk.Radiobutton(
+            output_frame, text="各源文件所在目录", variable=self.output_mode_var,
+            value="source", command=self._toggle_output_mode,
+            font=("Microsoft YaHei", 9), bg="#f5f5f5",
+        )
+        self.source_output_radio.pack(side="left", padx=(0, 12))
+        self.custom_output_radio = tk.Radiobutton(
+            output_frame, text="统一输出目录", variable=self.output_mode_var,
+            value="custom", command=self._toggle_output_mode,
+            font=("Microsoft YaHei", 9), bg="#f5f5f5",
+        )
+        self.custom_output_radio.pack(side="left")
+
+        self.output_dir_var = tk.StringVar()
+        self.output_entry = tk.Entry(
+            output_frame, textvariable=self.output_dir_var,
+            font=("Consolas", 9), state="readonly", readonlybackground="white",
+        )
+        self.output_entry.pack(side="left", padx=8, fill="x", expand=True)
+        self.browse_output_btn = tk.Button(
+            output_frame, text="选择...", font=("Microsoft YaHei", 9),
+            width=9, command=self.choose_output_dir,
+        )
+        self.browse_output_btn.pack(side="right")
+
         self.method_frame = tk.LabelFrame(
-            self.root, text=" PDF → Word 转换方式 ",
-            font=("Microsoft YaHei", 10),
-            bg="#f5f5f5", fg="#333", padx=12, pady=8,
+            self.root, text=" PDF → Word 转换方式 ", font=("Microsoft YaHei", 10),
+            bg="#f5f5f5", fg="#333", padx=10, pady=7,
         )
-        self.method_frame.pack(padx=30, pady=(12, 8), fill="x")
+        self.method_frame.pack(padx=24, pady=(10, 0), fill="x")
 
         self.method_var = tk.StringVar(value="word_com")
-
-        # 各方法的描述
+        self._method_labels = {}
         methods_desc = [
-            ("word_com",  "Microsoft Word 原生转换（推荐，可编辑，质量视 PDF 而定）"),
-            ("images",   "页面转高清图片嵌入（观感接近，文字通常不可编辑）"),
+            ("word_com", "Microsoft Word 原生转换（推荐，可编辑）"),
+            ("images", "页面转高清图片嵌入（观感接近，不可编辑）"),
             ("libreoffice", "LibreOffice 引擎（免费备选）"),
         ]
-        self._method_labels = {}  # 存储 Label 引用用于更新状态
-
-        for val, desc in methods_desc:
+        for value, description in methods_desc:
             row = tk.Frame(self.method_frame, bg="#f5f5f5")
             row.pack(anchor="w", pady=1, fill="x")
-
-            rb = tk.Radiobutton(
-                row, text=desc, variable=self.method_var, value=val,
+            radio = tk.Radiobutton(
+                row, text=description, variable=self.method_var, value=value,
                 font=("Microsoft YaHei", 9), bg="#f5f5f5", anchor="w",
             )
-            rb.pack(side="left")
-
-            status_lbl = tk.Label(
+            radio.pack(side="left")
+            status_label = tk.Label(
                 row, text="检测中...", font=("Microsoft YaHei", 8),
-                bg="#f5f5f5", fg="#999", width=12, anchor="e",
+                bg="#f5f5f5", fg="#777", width=10, anchor="e",
             )
-            status_lbl.pack(side="right")
+            status_label.pack(side="right")
+            self._method_widgets[value] = radio
+            self._method_labels[value] = status_label
 
-            self._method_widgets[val] = rb
-            self._method_labels[val] = status_lbl
-
-        # ── 按钮区 ──
-        btn_frame = tk.Frame(self.root, bg="#f5f5f5")
-        btn_frame.pack(pady=(8, 10))
-
+        action_frame = tk.Frame(self.root, bg="#f5f5f5")
+        action_frame.pack(pady=(10, 7))
         self.convert_btn = tk.Button(
-            btn_frame, text="开始转换", font=("Microsoft YaHei", 11, "bold"),
+            action_frame, text="开始批量转换", font=("Microsoft YaHei", 10, "bold"),
             width=15, command=self.start_conversion,
-            bg="#27ae60", fg="white", activebackground="#1e8449", cursor="hand2",
+            bg="#1e8449", fg="white", activebackground="#196f3d", cursor="hand2",
         )
-        self.convert_btn.pack(side="left", padx=6)
-
+        self.convert_btn.pack(side="left", padx=5)
+        self.cancel_btn = tk.Button(
+            action_frame, text="取消", font=("Microsoft YaHei", 10),
+            width=10, command=self.cancel_conversion,
+            bg="#a04000", fg="white", activebackground="#873600", cursor="hand2",
+        )
+        self.cancel_btn.pack(side="left", padx=5)
         self.open_btn = tk.Button(
-            btn_frame, text="打开文件夹", font=("Microsoft YaHei", 11),
-            width=15, command=self.open_output_folder,
+            action_frame, text="打开输出目录", font=("Microsoft YaHei", 10),
+            width=14, command=self.open_output_folder,
             bg="#555", fg="white", activebackground="#333", cursor="hand2",
         )
-        self.open_btn.pack(side="left", padx=6)
+        self.open_btn.pack(side="left", padx=5)
 
-        # ── 进度条 ──
-        self.progress = ttk.Progressbar(
-            self.root, mode="determinate", length=480, maximum=100,
-        )
-        self.progress.pack(pady=(8, 4))
+        progress_frame = tk.Frame(self.root, bg="#f5f5f5")
+        progress_frame.pack(padx=24, fill="x")
+        self.progress = ttk.Progressbar(progress_frame, mode="determinate", maximum=100)
+        self.progress.pack(fill="x")
+        self.progress_text_var = tk.StringVar(value="就绪")
+        tk.Label(
+            progress_frame, textvariable=self.progress_text_var,
+            font=("Microsoft YaHei", 8), bg="#f5f5f5", fg="#666", anchor="w",
+        ).pack(fill="x", pady=(2, 0))
 
-        # ── 日志 ──
         log_frame = tk.LabelFrame(
             self.root, text=" 转换日志 ", font=("Microsoft YaHei", 10),
-            bg="#f5f5f5", fg="#333", padx=8, pady=4,
+            bg="#f5f5f5", fg="#333", padx=7, pady=4,
         )
-        log_frame.pack(padx=30, pady=(4, 10), fill="both", expand=True)
-
-        text_scroll_frame = tk.Frame(log_frame, bg="#f5f5f5")
-        text_scroll_frame.pack(fill="both", expand=True)
-
+        log_frame.pack(padx=24, pady=(6, 12), fill="both", expand=True)
         self.log_text = tk.Text(
-            text_scroll_frame, height=8, font=("Consolas", 9),
+            log_frame, height=7, font=("Consolas", 9),
             bg="#1e1e1e", fg="#d4d4d4", wrap="word", state="disabled",
         )
-        scrollbar = ttk.Scrollbar(text_scroll_frame, command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side="right", fill="y")
+        log_scroll = ttk.Scrollbar(log_frame, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_scroll.set)
+        log_scroll.pack(side="right", fill="y")
         self.log_text.pack(side="left", fill="both", expand=True)
+        self._update_action_states()
 
     def _detect_engines(self):
-        """在后台检测可用引擎并更新 UI"""
-        def _detect():
+        def detect():
             have_word = word_com_available()
-            have_libre = libreoffice_available()
+            have_libreoffice = libreoffice_available()
             have_pymupdf = pymupdf_available()
-            self.root.after(0, self._update_engine_status,
-                            have_word, have_libre, have_pymupdf)
+            self.root.after(
+                0, self._update_engine_status,
+                have_word, have_libreoffice, have_pymupdf,
+            )
 
-        threading.Thread(target=_detect, daemon=True).start()
+        threading.Thread(target=detect, daemon=True).start()
 
-    def _update_engine_status(self, have_word, have_libre, have_pymupdf):
+    def _update_engine_status(self, have_word, have_libreoffice, have_pymupdf):
         self._avail_methods = {
             "word_com": have_word,
             "images": have_pymupdf,
-            "libreoffice": have_libre,
+            "libreoffice": have_libreoffice,
         }
+        for value, label in self._method_labels.items():
+            available = self._avail_methods[value]
+            label.config(
+                text="✓ 可用" if available else "✗ 不可用",
+                fg="#18794e" if available else "#b42318",
+            )
 
-        for val, label in self._method_labels.items():
-            if self._avail_methods.get(val):
-                label.config(text="✓ 可用", fg="#27ae60")
-            else:
-                label.config(text="✗ 不可用", fg="#e74c3c")
-
-        # 自动选择最佳可用方法
         if have_word:
             self.method_var.set("word_com")
         elif have_pymupdf:
             self.method_var.set("images")
-        else:
+        elif have_libreoffice:
             self.method_var.set("libreoffice")
 
-        for val, rb in self._method_widgets.items():
-            if not self._avail_methods.get(val):
-                rb.config(state="disabled")
+        self._engine_detection_complete = True
+        self._update_action_states()
+        self.log(f"Microsoft Word: {'可用' if have_word else '不可用'}")
+        self.log(f"PyMuPDF 图片模式: {'可用' if have_pymupdf else '不可用'}")
+        self.log(f"LibreOffice: {'可用' if have_libreoffice else '不可用'}")
 
-        if have_word:
-            self.log("✓ 检测到 Microsoft Word — 可使用原生高质量转换")
-        else:
-            self.log("✗ 未检测到 Microsoft Word")
-        if have_pymupdf:
-            self.log("✓ 检测到 PyMuPDF — 图片嵌入模式可用")
-        else:
-            self.log("✗ 未检测到 PyMuPDF，图片模式不可用")
-        if have_libre:
-            self.log("✓ 检测到 LibreOffice")
-        else:
-            self.log("✗ 未检测到 LibreOffice（可选）")
-
-    def log(self, msg: str):
+    def log(self, message: str):
         self.log_text.configure(state="normal")
-        self.log_text.insert("end", f"  {msg}\n")
+        self.log_text.insert("end", f"  {message}\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
-    def select_file(self, ext_hint: str):
-        filetypes = [
-            ("支持的文件", "*.pdf;*.docx"),
-            ("PDF 文件", "*.pdf"),
-            ("Word 文档", "*.docx"),
-        ]
-        file_path = filedialog.askopenfilename(title="选择文件", filetypes=filetypes)
-        if not file_path:
-            return
-
-        ext = Path(file_path).suffix.lower()
-        if ext not in (".pdf", ".docx"):
-            messagebox.showwarning("提示", f"不支持的文件类型: {ext}")
-            return
-
-        self.file_path = file_path
-        self.path_var.set(file_path)
-        self.log(f"已选择: {os.path.basename(file_path)}")
-
-        # 根据文件类型显示相关提示
-        if ext == ".pdf":
-            self.log(f"转换方向: PDF → Word")
+    def select_files(self, extension: str):
+        if extension == ".pdf":
+            title = "添加 PDF 文件"
+            filetypes = [("PDF 文件", "*.pdf")]
         else:
-            self.log(f"转换方向: Word → PDF")
+            title = "添加 Word 文件"
+            filetypes = [("Word 文档", "*.docx")]
+
+        selected = filedialog.askopenfilenames(title=title, filetypes=filetypes)
+        if not selected:
+            return
+
+        selected_paths = [Path(path) for path in selected if Path(path).suffix.lower() == extension]
+        if self.batch_extension and self.batch_extension != extension:
+            confirmed = messagebox.askyesno(
+                "切换转换方向",
+                "当前队列包含另一种文件。是否清空现有队列并切换转换方向？",
+            )
+            if not confirmed:
+                return
+            self._clear_queue(log_change=False)
+
+        previous_count = len(self.input_paths)
+        self.input_paths = deduplicate_paths(self.input_paths + selected_paths)
+        self.batch_extension = extension if self.input_paths else None
+        self._refresh_queue()
+        added_count = len(self.input_paths) - previous_count
+        self.log(f"已添加 {added_count} 个文件；队列共 {len(self.input_paths)} 个")
+
+    def _path_key(self, path: Path) -> str:
+        return os.path.normcase(os.path.normpath(str(Path(path).absolute())))
+
+    def _refresh_queue(self):
+        self.file_tree.delete(*self.file_tree.get_children())
+        self._tree_paths = {}
+        for path in self.input_paths:
+            item_id = self.file_tree.insert(
+                "", "end",
+                values=(path.name, str(path.parent), self.STATUS_TEXT["pending"], ""),
+            )
+            self._tree_paths[item_id] = path
+
+        if self.batch_extension == ".pdf":
+            direction = "PDF → Word"
+        elif self.batch_extension == ".docx":
+            direction = "Word → PDF"
+        else:
+            direction = ""
+        summary = f"{direction} · {len(self.input_paths)} 个文件" if direction else "尚未添加文件"
+        self.queue_summary_var.set(summary)
+        self._update_action_states()
+
+    def remove_selected(self):
+        selected_ids = self.file_tree.selection()
+        selected_keys = {
+            self._path_key(self._tree_paths[item_id])
+            for item_id in selected_ids if item_id in self._tree_paths
+        }
+        if not selected_keys:
+            return
+        self.input_paths = [
+            path for path in self.input_paths if self._path_key(path) not in selected_keys
+        ]
+        if not self.input_paths:
+            self.batch_extension = None
+        self._refresh_queue()
+        self.log(f"已移除 {len(selected_keys)} 个文件")
+
+    def clear_queue(self):
+        self._clear_queue(log_change=True)
+
+    def _clear_queue(self, log_change):
+        had_items = bool(self.input_paths)
+        self.input_paths = []
+        self.batch_extension = None
+        self._refresh_queue()
+        if had_items and log_change:
+            self.log("已清空转换队列")
+
+    def choose_output_dir(self):
+        initial_dir = self.output_dir_var.get() or None
+        directory = filedialog.askdirectory(title="选择统一输出目录", initialdir=initial_dir)
+        if directory:
+            self.output_dir_var.set(directory)
+            self.output_mode_var.set("custom")
+            self._toggle_output_mode()
+
+    def _toggle_output_mode(self):
+        self._update_action_states()
+
+    def _validate_output_dir(self):
+        if self.output_mode_var.get() == "source":
+            return None
+        raw_path = self.output_dir_var.get().strip()
+        if not raw_path:
+            raise ValueError("请选择统一输出目录")
+        output_dir = Path(raw_path)
+        if not output_dir.is_dir():
+            raise ValueError("输出目录不存在")
+        try:
+            import tempfile
+            with tempfile.NamedTemporaryFile(dir=str(output_dir), prefix=".pdf_word_converter_"):
+                pass
+        except OSError as exc:
+            raise ValueError(f"输出目录不可写: {exc}") from exc
+        return output_dir
 
     def start_conversion(self):
-        if not self.file_path:
-            messagebox.showwarning("提示", "请先选择文件")
+        if not self.input_paths:
+            messagebox.showwarning("提示", "请先添加文件")
             return
-        if not os.path.exists(self.file_path):
-            messagebox.showerror("错误", "文件不存在")
+        if not self._engine_detection_complete:
+            messagebox.showinfo("提示", "转换引擎仍在检测，请稍候")
             return
 
-        ext = Path(self.file_path).suffix.lower()
-
-        self.convert_btn["state"] = "disabled"
-        self.select_pdf_btn["state"] = "disabled"
-        self.select_docx_btn["state"] = "disabled"
-        self.progress["value"] = 0
-
-        if ext == ".pdf":
+        if self.batch_extension == ".pdf":
             method = self.method_var.get()
-            self.log(f"开始 PDF → Word 转换（方式: {method}）")
-            threading.Thread(
-                target=self._run_pdf_to_word, args=(method,), daemon=True
-            ).start()
-        elif ext == ".docx":
-            self.log("开始 Word → PDF 转换...")
-            threading.Thread(target=self._run_docx_to_pdf, daemon=True).start()
+            if not self._avail_methods.get(method):
+                messagebox.showerror("转换方式不可用", "请选择一个当前可用的 PDF 转换方式")
+                return
+            target_suffix = ".docx"
+        elif self.batch_extension == ".docx":
+            method = None
+            if not (self._avail_methods.get("word_com") or self._avail_methods.get("libreoffice")):
+                messagebox.showerror("缺少转换引擎", "Word → PDF 需要 Microsoft Word 或 LibreOffice")
+                return
+            target_suffix = ".pdf"
+        else:
+            messagebox.showerror("队列错误", "队列中的文件类型不受支持")
+            return
 
-    def _run_pdf_to_word(self, method):
         try:
-            input_path = Path(self.file_path)
-            output_path = input_path.with_suffix(".docx")
-            if output_path.exists():
-                output_path = input_path.with_name(
-                    f"{input_path.stem}_converted.docx"
-                )
+            output_dir = self._validate_output_dir()
+        except ValueError as exc:
+            messagebox.showerror("输出目录错误", str(exc))
+            return
 
-            pdf_path = str(input_path)
-            docx_path = str(output_path)
-
-            if method == "word_com":
-                pdf_to_word_via_word(pdf_path, docx_path, self._progress_update)
-                # Word COM 输出也做后处理
-                fix_converted_docx(docx_path, self._progress_update)
-            elif method == "images":
-                pdf_to_word_via_images(pdf_path, docx_path, self._progress_update)
-                # 图片模式不需要后处理（整页图片，无文字格式问题）
-            elif method == "libreoffice":
-                pdf_to_word_via_libreoffice(pdf_path, docx_path, self._progress_update)
-                # LO 输出也做后处理
-                fix_converted_docx(docx_path, self._progress_update)
-            else:
-                raise RuntimeError(f"未知转换方式: {method}")
-
-            self.output_path = str(output_path)
-            self.root.after(0, self._on_success,
-                            "PDF → Word 转换完成！", str(output_path))
-        except Exception as e:
-            import traceback
-            detail = traceback.format_exc()
-            self.root.after(0, self._on_error, f"转换失败: {e}\n\n{detail}")
-
-    def _run_docx_to_pdf(self):
-        try:
-            input_path = Path(self.file_path)
-            output_path = input_path.with_suffix(".pdf")
-            if output_path.exists():
-                output_path = input_path.with_name(
-                    f"{input_path.stem}_converted.pdf"
-                )
-
-            docx_path = str(input_path)
-            pdf_path = str(output_path)
-
-            if word_com_available():
-                docx_to_pdf_via_word(docx_path, pdf_path, self._progress_update)
-            elif libreoffice_available():
-                docx_to_pdf_via_libreoffice(docx_path, pdf_path, self._progress_update)
-            else:
-                raise RuntimeError(
-                    "Word → PDF 需要 Microsoft Word 或 LibreOffice。\n"
-                    "请安装其中之一：\n"
-                    "  • Microsoft Office (推荐)\n"
-                    "  • LibreOffice (免费): https://www.libreoffice.org/"
-                )
-
-            self.output_path = str(output_path)
-            self.root.after(0, self._on_success,
-                            "Word → PDF 转换完成！", str(output_path))
-        except Exception as e:
-            import traceback
-            detail = traceback.format_exc()
-            self.root.after(0, self._on_error, f"转换失败: {e}\n\n{detail}")
-
-    def _progress_update(self, msg: str, pct: int):
-        self.root.after(0, self._set_progress, msg, pct)
-
-    def _set_progress(self, msg, pct):
-        self.log(msg)
-        self.progress["value"] = pct
-
-    def _on_success(self, title, path):
-        self.progress["value"] = 100
-        self.convert_btn["state"] = "normal"
-        self.select_pdf_btn["state"] = "normal"
-        self.select_docx_btn["state"] = "normal"
-        self.log(f"✓ {title}")
-        self.log(f"  输出文件: {path}")
-        messagebox.showinfo("转换完成", f"{title}\n\n输出文件:\n{path}")
-
-    def _on_error(self, msg):
+        self.output_paths = []
+        self._cancel_event.clear()
+        self._reset_queue_status()
+        self._set_busy(True)
         self.progress["value"] = 0
-        self.convert_btn["state"] = "normal"
-        self.select_pdf_btn["state"] = "normal"
-        self.select_docx_btn["state"] = "normal"
-        self.log(f"✗ {msg}")
-        messagebox.showerror("转换错误", msg)
+        self.progress_text_var.set("准备转换...")
+        direction = "PDF → Word" if self.batch_extension == ".pdf" else "Word → PDF"
+        self.log(f"开始 {direction} 批量转换，共 {len(self.input_paths)} 个文件")
+
+        paths = list(self.input_paths)
+        extension = self.batch_extension
+        threading.Thread(
+            target=self._run_batch,
+            args=(paths, extension, target_suffix, output_dir, method),
+            daemon=True,
+        ).start()
+
+    def _reset_queue_status(self):
+        for item_id in self.file_tree.get_children():
+            values = list(self.file_tree.item(item_id, "values"))
+            values[2] = self.STATUS_TEXT["pending"]
+            values[3] = ""
+            self.file_tree.item(item_id, values=values, tags=())
+
+    def _run_batch(self, paths, extension, target_suffix, output_dir, method):
+        converter = self._create_converter(extension, method)
+        try:
+            results = run_conversion_batch(
+                paths,
+                target_suffix,
+                output_dir,
+                converter,
+                self._cancel_event,
+                self._progress_update,
+                self._status_update,
+            )
+            self.root.after(0, self._on_batch_complete, results)
+        except Exception as exc:
+            self.root.after(0, self._on_batch_error, str(exc))
+
+    def _create_converter(self, extension, method):
+        if extension == ".pdf":
+            def convert_pdf(source, output, progress):
+                if method == "word_com":
+                    pdf_to_word_via_word(
+                        source, output,
+                        lambda message, pct: progress(message, min(88, int(pct * 0.88))),
+                    )
+                    fix_converted_docx(
+                        output,
+                        lambda message, pct: progress(message, min(99, max(89, pct))),
+                    )
+                elif method == "images":
+                    pdf_to_word_via_images(source, output, progress)
+                elif method == "libreoffice":
+                    pdf_to_word_via_libreoffice(
+                        source, output,
+                        lambda message, pct: progress(message, min(88, int(pct * 0.88))),
+                    )
+                    fix_converted_docx(
+                        output,
+                        lambda message, pct: progress(message, min(99, max(89, pct))),
+                    )
+                else:
+                    raise RuntimeError(f"未知转换方式: {method}")
+
+            return convert_pdf
+
+        def convert_docx(source, output, progress):
+            if word_com_available():
+                docx_to_pdf_via_word(source, output, progress)
+            elif libreoffice_available():
+                docx_to_pdf_via_libreoffice(source, output, progress)
+            else:
+                raise RuntimeError("Word → PDF 需要 Microsoft Word 或 LibreOffice")
+
+        return convert_docx
+
+    def _progress_update(self, current, total, message, pct):
+        self.root.after(0, self._set_progress, current, total, message, pct)
+
+    def _set_progress(self, current, total, message, pct):
+        self.progress["value"] = pct
+        self.progress_text_var.set(f"[{current}/{total}] {message} · 总进度 {pct}%")
+        self.log(f"[{current}/{total}] {message}")
+
+    def _status_update(self, result: BatchResult):
+        self.root.after(0, self._apply_status_update, result)
+
+    def _apply_status_update(self, result: BatchResult):
+        item_id = next(
+            (
+                current_id for current_id, path in self._tree_paths.items()
+                if self._path_key(path) == self._path_key(result.source)
+            ),
+            None,
+        )
+        if item_id:
+            values = list(self.file_tree.item(item_id, "values"))
+            values[2] = self.STATUS_TEXT[result.status]
+            values[3] = str(result.output) if result.output and result.status != "cancelled" else ""
+            self.file_tree.item(item_id, values=values, tags=(result.status,))
+            self.file_tree.see(item_id)
+
+        if result.status == "running":
+            self.log(f"开始: {result.source.name}")
+        elif result.status == "success":
+            self.log(f"成功: {result.output}")
+        elif result.status == "failed":
+            self.log(f"失败: {result.source.name} - {result.error}")
+
+    def cancel_conversion(self):
+        if not self._is_converting or self._cancel_event.is_set():
+            return
+        self._cancel_event.set()
+        self.cancel_btn.config(state="disabled")
+        self.progress_text_var.set("正在等待当前文件处理结束后取消...")
+        self.log("已请求取消；当前文件结束后将停止后续任务")
+
+    def _on_batch_complete(self, results):
+        self._set_busy(False)
+        successful = [result for result in results if result.status == "success"]
+        failed = [result for result in results if result.status == "failed"]
+        cancelled = [result for result in results if result.status == "cancelled"]
+        self.output_paths = [result.output for result in successful if result.output]
+
+        summary = f"成功 {len(successful)}，失败 {len(failed)}，取消 {len(cancelled)}"
+        self.queue_summary_var.set(f"批次完成 · {summary}")
+        self.progress_text_var.set(summary)
+        if not cancelled:
+            self.progress["value"] = 100
+        self.log(f"批次结束: {summary}")
+
+        details = ""
+        if failed:
+            shown = failed[:3]
+            details = "\n\n失败详情:\n" + "\n".join(
+                f"- {result.source.name}: {result.error}" for result in shown
+            )
+            if len(failed) > len(shown):
+                details += f"\n- 另有 {len(failed) - len(shown)} 个失败，请查看日志"
+
+        message = summary + details
+        if len(successful) == len(results):
+            messagebox.showinfo("转换完成", message)
+        elif not successful and failed and not cancelled:
+            messagebox.showerror("转换失败", message)
+        else:
+            messagebox.showwarning("批次已结束", message)
+
+    def _on_batch_error(self, error):
+        self._set_busy(False)
+        self.progress_text_var.set("批次异常终止")
+        self.log(f"批次异常终止: {error}")
+        messagebox.showerror("转换错误", error)
+
+    def _set_busy(self, busy):
+        self._is_converting = busy
+        self._update_action_states()
+
+    def _update_action_states(self):
+        editable_state = "disabled" if self._is_converting else "normal"
+        self.select_pdf_btn.config(state=editable_state)
+        self.select_docx_btn.config(state=editable_state)
+        self.clear_btn.config(
+            state="normal" if self.input_paths and not self._is_converting else "disabled"
+        )
+        self.remove_btn.config(
+            state="normal" if self.file_tree.selection() and not self._is_converting else "disabled"
+        )
+        self.source_output_radio.config(state=editable_state)
+        self.custom_output_radio.config(state=editable_state)
+        browse_enabled = not self._is_converting and self.output_mode_var.get() == "custom"
+        self.browse_output_btn.config(state="normal" if browse_enabled else "disabled")
+        can_start = self.input_paths and self._engine_detection_complete and not self._is_converting
+        self.convert_btn.config(state="normal" if can_start else "disabled")
+        self.cancel_btn.config(state="normal" if self._is_converting else "disabled")
+
+        for value, radio in self._method_widgets.items():
+            enabled = (
+                not self._is_converting
+                and self.batch_extension != ".docx"
+                and self._avail_methods.get(value, False)
+            )
+            radio.config(state="normal" if enabled else "disabled")
 
     def open_output_folder(self):
         target = None
-        if self.output_path and os.path.exists(self.output_path):
-            target = os.path.dirname(self.output_path)
-        elif self.file_path and os.path.exists(self.file_path):
-            target = os.path.dirname(self.file_path)
-        if target:
-            os.startfile(target)
+        if self.output_paths:
+            target = self.output_paths[0].parent
+        elif self.output_mode_var.get() == "custom" and self.output_dir_var.get():
+            candidate = Path(self.output_dir_var.get())
+            if candidate.is_dir():
+                target = candidate
+        elif self.input_paths:
+            target = self.input_paths[0].parent
+
+        if target and target.is_dir():
+            os.startfile(str(target))
         else:
-            messagebox.showinfo("提示", "尚未进行过转换操作")
+            messagebox.showinfo("提示", "当前没有可打开的输出目录")
 
 
 def main():
