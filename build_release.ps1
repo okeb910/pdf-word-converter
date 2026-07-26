@@ -1,6 +1,5 @@
-﻿param(
+param(
     [string]$PythonExe = "python",
-    [string]$InnoCompiler = "",
     [string]$ReleaseDir = ""
 )
 
@@ -31,23 +30,6 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "PyInstaller build failed with exit code $LASTEXITCODE"
     }
-
-    if (-not $InnoCompiler) {
-        $Candidates = @(
-            "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",
-            "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
-            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-        )
-        $InnoCompiler = $Candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
-    }
-    if (-not $InnoCompiler) {
-        throw "Inno Setup 6 compiler (ISCC.exe) was not found."
-    }
-
-    & $InnoCompiler "packaging\installer.iss"
-    if ($LASTEXITCODE -ne 0) {
-        throw "Inno Setup build failed with exit code $LASTEXITCODE"
-    }
 }
 finally {
     Pop-Location
@@ -55,17 +37,15 @@ finally {
 
 if ($ReleaseDir) {
     New-Item -ItemType Directory -Path $ReleaseDir -Force | Out-Null
-    $PortableSource = Join-Path $DistDir "PDFWordConverter-v0.4.0-Portable-x64.exe"
-    $SetupSource = Join-Path $DistDir "PDFWordConverter-v0.4.0-Setup-x64.exe"
-    $PortableRelease = Join-Path $ReleaseDir "PDF-Word-PPT批量转换工具-v0.4.0-便携版-x64.exe"
-    $SetupRelease = Join-Path $ReleaseDir "PDF-Word-PPT批量转换工具-v0.4.0-安装版-x64.exe"
+    $PortableSource = Join-Path $DistDir "PDFWordConverter-v0.4.1-Portable-x64.exe"
+    $PortableRelease = Join-Path $ReleaseDir "PDF-Word-PPT批量转换工具-v0.4.1-便携版-x64.exe"
     Copy-Item -LiteralPath $PortableSource -Destination $PortableRelease -Force
-    Copy-Item -LiteralPath $SetupSource -Destination $SetupRelease -Force
     Copy-Item -LiteralPath (Join-Path $ProjectDir "packaging\README-使用说明.txt") -Destination $ReleaseDir -Force
+    Copy-Item -LiteralPath (Join-Path $ProjectDir "THIRD_PARTY_NOTICES.md") -Destination $ReleaseDir -Force
 
-    $Hashes = Get-FileHash -Algorithm SHA256 -LiteralPath $PortableRelease, $SetupRelease
-    $HashLines = $Hashes | ForEach-Object { "{0}  {1}" -f $_.Hash.ToLowerInvariant(), (Split-Path -Leaf $_.Path) }
-    Set-Content -LiteralPath (Join-Path $ReleaseDir "SHA256SUMS.txt") -Value $HashLines -Encoding utf8
+    $Hash = Get-FileHash -Algorithm SHA256 -LiteralPath $PortableRelease
+    $HashLine = "{0}  {1}" -f $Hash.Hash.ToLowerInvariant(), (Split-Path -Leaf $Hash.Path)
+    Set-Content -LiteralPath (Join-Path $ReleaseDir "SHA256SUMS.txt") -Value $HashLine -Encoding utf8
 }
 
-Write-Host "Build completed: $DistDir"
+Write-Host "Portable build completed: $DistDir"

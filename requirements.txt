@@ -2,3 +2,4 @@ PyMuPDF>=1.23.0
 python-docx>=0.8.11
 python-pptx>=1.0.0
 comtypes>=1.2.0
+tkinterdnd2>=0.4.3

@@ -19,10 +19,20 @@ import os
 import io
 import logging
 import threading
+import sys
 import subprocess
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
+
+try:
+    from tkinterdnd2 import COPY, DND_FILES, REFUSE_DROP, TkinterDnD
+except Exception:
+    COPY = "copy"
+    DND_FILES = None
+    REFUSE_DROP = "refuse_drop"
+    TkinterDnD = None
 
 from app_environment import (
     APP_VERSION,
@@ -36,6 +46,7 @@ from conversion_specs import (
     PDF_TARGET_WORD,
     resolve_conversion_spec,
 )
+from drop_logic import MixedSourceKindsError, classify_dropped_paths
 
 
 # ═══════════════════════════════════════════════════════════
@@ -73,6 +84,18 @@ def _check_powerpoint_com_available():
             comtypes.CoUninitialize()
     except Exception:
         logging.exception("Microsoft PowerPoint COM detection failed")
+        return False
+def _com_application_registered(prog_id: str) -> bool:
+    """Check Office COM registration without opening the application."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, rf"{prog_id}\CLSID") as key:
+            clsid, _value_type = winreg.QueryValueEx(key, None)
+        return bool(clsid)
+    except (ImportError, OSError):
         return False
 
 
@@ -154,7 +177,17 @@ def _check_pptx_component_available():
 
 
 # 缓存检测结果（加锁防竞态）
-_ENGINE_LOCK = threading.Lock()
+_WORD_LOCK = threading.Lock()
+_POWERPOINT_LOCK = threading.Lock()
+_LIBREOFFICE_LOCK = threading.Lock()
+_PYMUPDF_LOCK = threading.Lock()
+_PPTX_COMPONENT_LOCK = threading.Lock()
+_ENGINE_CACHE_GENERATION = 0
+_WORD_CACHE_GENERATION = -1
+_POWERPOINT_CACHE_GENERATION = -1
+_LIBREOFFICE_CACHE_GENERATION = -1
+_PYMUPDF_CACHE_GENERATION = -1
+_PPTX_COMPONENT_CACHE_GENERATION = -1
 _WORD_AVAILABLE = None
 _POWERPOINT_AVAILABLE = None
 _LIBREOFFICE_AVAILABLE = None
@@ -163,56 +196,81 @@ _PPTX_COMPONENT_AVAILABLE = None
 
 
 def reset_engine_cache():
-    """Clear engine detection state after an installation attempt."""
-    global _LO_PATH, _WORD_AVAILABLE, _POWERPOINT_AVAILABLE
+    """Invalidate cached checks without waiting for an older probe."""
+    global _ENGINE_CACHE_GENERATION, _LO_PATH, _WORD_AVAILABLE, _POWERPOINT_AVAILABLE
     global _LIBREOFFICE_AVAILABLE, _PYMUPDF_AVAILABLE, _PPTX_COMPONENT_AVAILABLE
-    with _ENGINE_LOCK:
-        _LO_PATH = None
-        _WORD_AVAILABLE = None
-        _POWERPOINT_AVAILABLE = None
-        _LIBREOFFICE_AVAILABLE = None
-        _PYMUPDF_AVAILABLE = None
-        _PPTX_COMPONENT_AVAILABLE = None
+    _ENGINE_CACHE_GENERATION += 1
+    _LO_PATH = None
+    _WORD_AVAILABLE = None
+    _POWERPOINT_AVAILABLE = None
+    _LIBREOFFICE_AVAILABLE = None
+    _PYMUPDF_AVAILABLE = None
+    _PPTX_COMPONENT_AVAILABLE = None
 
 
 def word_com_available():
-    global _WORD_AVAILABLE
-    with _ENGINE_LOCK:
-        if _WORD_AVAILABLE is None:
-            _WORD_AVAILABLE = _check_word_com_available()
-    return _WORD_AVAILABLE
+    global _WORD_AVAILABLE, _WORD_CACHE_GENERATION
+    generation = _ENGINE_CACHE_GENERATION
+    with _WORD_LOCK:
+        if _WORD_CACHE_GENERATION != generation:
+            result = _check_word_com_available()
+            if generation == _ENGINE_CACHE_GENERATION:
+                _WORD_AVAILABLE = result
+                _WORD_CACHE_GENERATION = generation
+            return result
+        return _WORD_AVAILABLE
 
 
 def powerpoint_com_available():
-    global _POWERPOINT_AVAILABLE
-    with _ENGINE_LOCK:
-        if _POWERPOINT_AVAILABLE is None:
-            _POWERPOINT_AVAILABLE = _check_powerpoint_com_available()
-    return _POWERPOINT_AVAILABLE
+    global _POWERPOINT_AVAILABLE, _POWERPOINT_CACHE_GENERATION
+    generation = _ENGINE_CACHE_GENERATION
+    with _POWERPOINT_LOCK:
+        if _POWERPOINT_CACHE_GENERATION != generation:
+            result = _check_powerpoint_com_available()
+            if generation == _ENGINE_CACHE_GENERATION:
+                _POWERPOINT_AVAILABLE = result
+                _POWERPOINT_CACHE_GENERATION = generation
+            return result
+        return _POWERPOINT_AVAILABLE
 
 
 def libreoffice_available():
-    global _LIBREOFFICE_AVAILABLE
-    with _ENGINE_LOCK:
-        if _LIBREOFFICE_AVAILABLE is None:
-            _LIBREOFFICE_AVAILABLE = _check_libreoffice_available()
-    return _LIBREOFFICE_AVAILABLE
+    global _LIBREOFFICE_AVAILABLE, _LIBREOFFICE_CACHE_GENERATION
+    generation = _ENGINE_CACHE_GENERATION
+    with _LIBREOFFICE_LOCK:
+        if _LIBREOFFICE_CACHE_GENERATION != generation:
+            result = _check_libreoffice_available()
+            if generation == _ENGINE_CACHE_GENERATION:
+                _LIBREOFFICE_AVAILABLE = result
+                _LIBREOFFICE_CACHE_GENERATION = generation
+            return result
+        return _LIBREOFFICE_AVAILABLE
 
 
 def pymupdf_available():
-    global _PYMUPDF_AVAILABLE
-    with _ENGINE_LOCK:
-        if _PYMUPDF_AVAILABLE is None:
-            _PYMUPDF_AVAILABLE = _check_pymupdf_available()
-    return _PYMUPDF_AVAILABLE
+    global _PYMUPDF_AVAILABLE, _PYMUPDF_CACHE_GENERATION
+    generation = _ENGINE_CACHE_GENERATION
+    with _PYMUPDF_LOCK:
+        if _PYMUPDF_CACHE_GENERATION != generation:
+            result = _check_pymupdf_available()
+            if generation == _ENGINE_CACHE_GENERATION:
+                _PYMUPDF_AVAILABLE = result
+                _PYMUPDF_CACHE_GENERATION = generation
+            return result
+        return _PYMUPDF_AVAILABLE
 
 
 def pptx_component_available():
-    global _PPTX_COMPONENT_AVAILABLE
-    with _ENGINE_LOCK:
-        if _PPTX_COMPONENT_AVAILABLE is None:
-            _PPTX_COMPONENT_AVAILABLE = _check_pptx_component_available()
-    return _PPTX_COMPONENT_AVAILABLE
+    global _PPTX_COMPONENT_AVAILABLE, _PPTX_COMPONENT_CACHE_GENERATION
+    generation = _ENGINE_CACHE_GENERATION
+    with _PPTX_COMPONENT_LOCK:
+        if _PPTX_COMPONENT_CACHE_GENERATION != generation:
+            result = _check_pptx_component_available()
+            if generation == _ENGINE_CACHE_GENERATION:
+                _PPTX_COMPONENT_AVAILABLE = result
+                _PPTX_COMPONENT_CACHE_GENERATION = generation
+            return result
+        return _PPTX_COMPONENT_AVAILABLE
 
 
 # ═══════════════════════════════════════════════════════════
@@ -838,6 +896,7 @@ class ConverterApp:
         self._winget_path = None
         self._cancel_event = threading.Event()
         self._setup_ui()
+        self._setup_drag_and_drop()
         self._detect_engines()
 
     def _setup_ui(self):
@@ -851,6 +910,10 @@ class ConverterApp:
             self.root, text="本地串行转换 · 支持批量队列 · 文件不会上传",
             font=("Microsoft YaHei", 10), bg="#f5f5f5", fg="#666",
         ).pack(pady=(0, 12))
+        tk.Label(
+            self.root, text="Copyright (c) 2026 okeb910 · AGPL-3.0 · github.com/okeb910/pdf-word-converter",
+            font=("Microsoft YaHei", 8), bg="#f5f5f5", fg="#666",
+        ).pack(pady=(0, 6))
 
         file_frame = tk.LabelFrame(
             self.root, text=" 转换队列 ", font=("Microsoft YaHei", 10),
@@ -917,8 +980,15 @@ class ConverterApp:
         )
         self.target_combo.pack(side="left")
         self.target_combo.bind("<<ComboboxSelected>>", self._on_target_selected)
+        self._target_zones = {}
+        self.target_zones_frame = tk.Frame(file_frame, bg="#f5f5f5")
+        self.target_zones_frame.pack(fill="x", pady=(0, 7))
+        self._create_pdf_target_zone(PDF_TARGET_WORD, "拖入 PDF 转 Word")
+        self._create_pdf_target_zone(PDF_TARGET_POWERPOINT, "拖入 PDF 转 PowerPoint")
+        self._refresh_target_zones()
 
         tree_frame = tk.Frame(file_frame, bg="#f5f5f5")
+        self.tree_frame = tree_frame
         tree_frame.pack(fill="both", expand=True)
         columns = ("name", "folder", "status", "output")
         self.file_tree = ttk.Treeview(
@@ -941,6 +1011,11 @@ class ConverterApp:
         tree_scroll.pack(side="right", fill="y")
         self.file_tree.pack(side="left", fill="both", expand=True)
         self.file_tree.bind("<<TreeviewSelect>>", lambda _event: self._update_action_states())
+        self.empty_drop_hint = tk.Label(
+            file_frame, text="可将 PDF、Word 或 PowerPoint 文件拖到此处",
+            font=("Microsoft YaHei", 9), bg="#f5f5f5", fg="#666", pady=5,
+        )
+        self.empty_drop_hint.pack(fill="x")
 
         output_frame = tk.LabelFrame(
             self.root, text=" 输出位置 ", font=("Microsoft YaHei", 10),
@@ -1153,6 +1228,230 @@ class ConverterApp:
         self.log(f"LibreOffice: {'可用' if have_libreoffice else '不可用'}")
         self.log(f"winget: {'可用' if winget_path else '不可用'}")
 
+    def _create_pdf_target_zone(self, target_kind, text):
+        zone = tk.Label(
+            self.target_zones_frame, text=text, font=("Microsoft YaHei", 9, "bold"),
+            bg="white", fg="#333", borderwidth=1, relief="solid", padx=10, pady=6,
+            cursor="hand2",
+        )
+        zone.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        zone.bind("<Button-1>", lambda _event, kind=target_kind: self._select_pdf_target(kind))
+        self._target_zones[target_kind] = zone
+
+    def _refresh_target_zones(self):
+        if not hasattr(self, "_target_zones"):
+            return
+        selected = self._current_target_kind()
+        editable = not self._is_converting and not self._is_installing and self.source_kind in (None, "pdf")
+        for target_kind, zone in self._target_zones.items():
+            selected_zone = target_kind == selected
+            zone.config(
+                bg="#e8f5e9" if selected_zone else ("white" if editable else "#ededed"),
+                fg="#145a32" if selected_zone else ("#333" if editable else "#888"),
+                relief="sunken" if selected_zone else "solid",
+                cursor="hand2" if editable else "arrow",
+            )
+
+    def _confirm_pdf_target_change(self, target_kind):
+        current_target = self._current_target_kind()
+        if self.source_kind != "pdf" or not self.input_paths or current_target == target_kind:
+            return True
+        return messagebox.askyesno(
+            "切换整批转换目标",
+            f"当前队列中的 {len(self.input_paths)} 个 PDF 将全部转换为 "
+            f"{self.TARGET_DISPLAY[target_kind]}。是否继续？",
+        )
+
+    def _select_pdf_target(self, target_kind):
+        if self._is_converting or self._is_installing or self.source_kind not in (None, "pdf"):
+            return
+        if not self._confirm_pdf_target_change(target_kind):
+            return
+        self._set_target_kind(target_kind)
+        self._update_method_panel()
+        self._refresh_queue()
+
+    def _setup_drag_and_drop(self):
+        if DND_FILES is None:
+            if hasattr(self, "empty_drop_hint"):
+                self.empty_drop_hint.config(text="拖放组件不可用，请使用上方按钮添加文件", fg="#666")
+            return
+        try:
+            for widget in (self.file_tree, self.empty_drop_hint):
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<DropEnter>>", lambda event: self._on_drop_hover(event, None, True))
+                widget.dnd_bind("<<DropLeave>>", lambda event: self._on_drop_hover(event, None, False))
+                widget.dnd_bind("<<Drop>>", lambda event: self._on_files_dropped(event, None))
+            for target_kind, widget in self._target_zones.items():
+                widget.drop_target_register(DND_FILES)
+                widget.dnd_bind("<<DropEnter>>", lambda event, kind=target_kind: self._on_drop_hover(event, kind, True))
+                widget.dnd_bind("<<DropLeave>>", lambda event, kind=target_kind: self._on_drop_hover(event, kind, False))
+                widget.dnd_bind("<<Drop>>", lambda event, kind=target_kind: self._on_files_dropped(event, kind))
+        except (AttributeError, tk.TclError):
+            logging.exception("TkDND initialization failed")
+            self.empty_drop_hint.config(text="拖放组件不可用，请使用上方按钮添加文件", fg="#666")
+
+    def _on_drop_hover(self, _event, target_kind, active):
+        if target_kind is None and hasattr(self, "tree_frame"):
+            color = "#1e8449" if active else "#d0d0d0"
+            self.tree_frame.config(highlightbackground=color, highlightcolor=color)
+        elif target_kind is not None and hasattr(self, "_target_zones"):
+            if active:
+                self._target_zones[target_kind].config(bg="#fff2cc")
+            else:
+                self._refresh_target_zones()
+        return REFUSE_DROP if self._is_converting or self._is_installing else COPY
+
+    def _on_files_dropped(self, event, forced_pdf_target=None):
+        self._on_drop_hover(event, forced_pdf_target, False)
+        if self._is_converting or self._is_installing:
+            return REFUSE_DROP
+        try:
+            dropped = self.root.tk.splitlist(event.data)
+        except tk.TclError as exc:
+            self.log(f"无法解析拖入的文件: {exc}")
+            messagebox.showerror("拖放失败", "无法读取拖入的文件路径。")
+            return REFUSE_DROP
+        try:
+            source_kind, accepted, ignored = classify_dropped_paths(dropped)
+        except MixedSourceKindsError as exc:
+            self.log(str(exc))
+            messagebox.showwarning("请分批拖入", f"{exc}\n\n每个批次只能处理一种源格式。")
+            return REFUSE_DROP
+        if not accepted:
+            messagebox.showwarning("没有可添加的文件", "仅支持 PDF、DOCX、PPT 和 PPTX 文件。")
+            return REFUSE_DROP
+        if forced_pdf_target is not None and source_kind != "pdf":
+            messagebox.showinfo("此区域仅接收 PDF", "请将 Word 或 PowerPoint 文件拖到转换队列。")
+            return REFUSE_DROP
+        if source_kind == "pdf":
+            target_kind = forced_pdf_target or self._current_target_kind()
+            if target_kind == "pdf":
+                target_kind = PDF_TARGET_WORD
+        else:
+            target_kind = "pdf"
+        added = self._add_paths(source_kind, accepted, target_kind)
+        if not added:
+            return REFUSE_DROP
+        if ignored:
+            messagebox.showwarning("已忽略部分内容", f"已添加 {added} 个文件，忽略 {len(ignored)} 个不支持的项目。")
+        return COPY
+
+    def _detect_engines(self, force=False):
+        if force:
+            reset_engine_cache()
+        self._engine_generation = getattr(self, "_engine_generation", 0) + 1
+        generation = self._engine_generation
+        if force and self._is_installing:
+            self._install_detection_generation = generation
+        self._engine_detection_complete = False
+        self._engine_started_at = time.perf_counter()
+        self._word_registered = _com_application_registered("Word.Application")
+        self._powerpoint_registered = _com_application_registered("PowerPoint.Application")
+        probes = {
+            "word_com": word_com_available,
+            "powerpoint_com": powerpoint_com_available,
+            "libreoffice": libreoffice_available,
+            "images": pymupdf_available,
+            "pptx": pptx_component_available,
+            "winget": find_winget,
+        }
+        self._pending_engine_checks = set(probes)
+        self._engine_elapsed_ms = {}
+        self._avail_methods = {key: None for key in probes if key != "winget"}
+        self._winget_path = None
+        self._update_engine_indicators()
+        self._refresh_engine_status_text()
+        self._update_action_states()
+        for key, probe in probes.items():
+            threading.Thread(target=self._run_engine_probe, args=(generation, key, probe), daemon=True).start()
+            self.root.after(20000, self._expire_engine_probe, generation, key)
+
+    def _expire_engine_probe(self, generation, key):
+        if generation != self._engine_generation or key not in self._pending_engine_checks:
+            return
+        self._apply_engine_probe_result(generation, key, False, 20000)
+
+    def _run_engine_probe(self, generation, key, probe):
+        started_at = time.perf_counter()
+        try:
+            result = probe()
+        except Exception as exc:
+            logging.exception("Environment probe failed: %s", key)
+            result = False
+            self.log(f"{key} 检测失败: {exc}")
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000)
+        self.root.after(0, self._apply_engine_probe_result, generation, key, result, elapsed_ms)
+
+    def _availability_text(self, key, available):
+        if available is None:
+            return "检测中"
+        if available:
+            return "可用"
+        registered = {"word_com": getattr(self, "_word_registered", False), "powerpoint_com": getattr(self, "_powerpoint_registered", False)}.get(key, False)
+        return "已安装/启动失败" if registered else "不可用"
+
+    def _apply_engine_probe_result(self, generation, key, result, elapsed_ms):
+        if generation != self._engine_generation or key not in self._pending_engine_checks:
+            return
+        self._pending_engine_checks.discard(key)
+        self._engine_elapsed_ms[key] = elapsed_ms
+        if key == "winget":
+            self._winget_path = result or None
+        else:
+            self._avail_methods[key] = bool(result)
+        available = bool(self._winget_path) if key == "winget" else self._avail_methods[key]
+        names = {"word_com": "Microsoft Word", "powerpoint_com": "Microsoft PowerPoint", "libreoffice": "LibreOffice", "images": "PyMuPDF 图片模式", "pptx": "内置 PPTX 组件", "winget": "winget"}
+        self.log(f"{names[key]}: {self._availability_text(key, available)}（检测 {elapsed_ms} ms）")
+        if not self._is_installing and self._avail_methods.get(self.method_var.get()) is False:
+            self._select_best_pdf_method()
+        if not self._pending_engine_checks:
+            self._engine_detection_complete = True
+            if getattr(self, "_install_detection_generation", None) == generation:
+                self._is_installing = False
+                self._install_detection_generation = None
+            total_ms = round((time.perf_counter() - self._engine_started_at) * 1000)
+            self.log(f"环境检测完成，共 {total_ms} ms")
+        self._update_engine_indicators()
+        self._refresh_engine_status_text()
+        self._update_method_panel()
+        self._update_action_states()
+
+    def _update_engine_indicators(self):
+        for value, label in self._method_labels.items():
+            available = self._avail_methods.get(value)
+            label.config(text="检测中..." if available is None else ("✓ 可用" if available else "✗ 不可用"), fg="#777" if available is None else ("#18794e" if available else "#b42318"))
+        images = self._avail_methods.get("images")
+        pptx = self._avail_methods.get("pptx")
+        if images is None or pptx is None:
+            self.pptx_status_label.config(text="检测中...", fg="#777")
+        else:
+            self.pptx_status_label.config(text="✓ 可用" if images and pptx else "✗ 不可用", fg="#18794e" if images and pptx else "#b42318")
+
+    def _refresh_engine_status_text(self):
+        values = self._avail_methods
+        winget = "检测中" if "winget" in self._pending_engine_checks else ("可用" if self._winget_path else "不可用")
+        self.engine_status_var.set(" | ".join((
+            f"Word: {self._availability_text('word_com', values.get('word_com'))}",
+            f"PowerPoint: {self._availability_text('powerpoint_com', values.get('powerpoint_com'))}",
+            f"LibreOffice: {self._availability_text('libreoffice', values.get('libreoffice'))}",
+            f"winget: {winget}",
+        )))
+
+    def _conversion_detection_ready(self):
+        spec = self._current_spec()
+        if spec is None:
+            return False
+        if spec.key == "pdf_to_word":
+            return self._avail_methods.get(self.method_var.get()) is not None
+        if spec.key == "pdf_to_powerpoint":
+            return self._avail_methods.get("images") is not None and self._avail_methods.get("pptx") is not None
+        if spec.key == "word_to_pdf":
+            word = self._avail_methods.get("word_com")
+            return word is True or (word is False and self._avail_methods.get("libreoffice") is not None)
+        powerpoint = self._avail_methods.get("powerpoint_com")
+        return powerpoint is True or (powerpoint is False and self._avail_methods.get("libreoffice") is not None)
+
     def _current_target_kind(self):
         return self.TARGET_KIND.get(self.target_display_var.get(), PDF_TARGET_WORD)
 
@@ -1215,6 +1514,13 @@ class ConverterApp:
 
     def _prompt_word_install(self):
         if self._avail_methods.get("word_com") or self._is_installing:
+            return False
+        if getattr(self, "_word_registered", False):
+            self.log("Microsoft Word is installed but COM automation is unavailable")
+            messagebox.showwarning(
+                "Microsoft Word 暂不可用",
+                "已检测到 Microsoft Word，但其自动化启动失败。请关闭登录、许可或提示窗口后重试，无需重复安装。",
+            )
             return False
         confirmed = messagebox.askyesno(
             "未检测到 Microsoft Word",
@@ -1752,7 +2058,7 @@ class ConverterApp:
 
 
 def main():
-    root = tk.Tk()
+    root = TkinterDnD.Tk() if TkinterDnD is not None else tk.Tk()
     try:
         root.iconbitmap(default="")
     except Exception:

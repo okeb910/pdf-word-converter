@@ -4,7 +4,7 @@ Windows 本地 **PDF、Word（.docx）与 PowerPoint（.ppt/.pptx）批量转换
 
 ![平台](https://img.shields.io/badge/platform-Windows-blue)
 ![Python](https://img.shields.io/badge/python-3.8%2B-yellow)
-![License](https://img.shields.io/badge/license-MIT-green)
+![License](https://img.shields.io/badge/license-AGPL--3.0-blue)
 ![Release](https://img.shields.io/github/v/release/okeb910/pdf-word-converter)
 
 ---
@@ -13,12 +13,14 @@ Windows 本地 **PDF、Word（.docx）与 PowerPoint（.ppt/.pptx）批量转换
 
 **目标电脑不需要安装 Python，不需要运行 pip，也不需要下载源码。**
 
-v0.4.0 只发布便携版。请从 [GitHub Releases](https://github.com/okeb910/pdf-word-converter/releases/tag/v0.4.0) 下载：
+v0.4.1 只发布便携版。请从 [GitHub Releases](https://github.com/okeb910/pdf-word-converter/releases/tag/v0.4.1) 下载：
 
 | 文件 | 说明 |
 |------|------|
-| `PDF-Word-PPT-Converter-v0.4.0-Portable-x64.exe` | **主程序**：下载后直接双击运行，无需安装 |
+| `PDF-Word-PPT批量转换工具-v0.4.1-便携版-x64.exe` | **主程序**：下载后直接双击运行，无需安装 |
 | `SHA256SUMS.txt` | 便携版 EXE 的 SHA-256 校验值 |
+
+v0.4.1 改进：支持将文件拖入队列或目标区域；环境检测改为并行执行，并为卡住的检测设置 20 秒超时。已检测到但无法启动的 Word 不会再提示重复安装。
 
 - 支持 **64 位 Windows 10 / 11**。
 - EXE 暂未数字签名，SmartScreen 可能显示“未知发布者”；可点击“更多信息”后选择“仍要运行”。
@@ -122,14 +124,12 @@ python pdf_word_converter.py
 ├── app_environment.py      # 冻结环境检测与按需安装
 ├── launcher.py             # 打包版启动检查与错误日志
 ├── build_release.ps1       # 本地构建脚本
-├── packaging/              # PyInstaller、manifest、Inno Setup
+├── packaging/              # PyInstaller、manifest、版本信息与发布说明
 ├── tests/                  # 自动化测试
 └── requirements*.txt       # 运行与构建依赖
 ```
 
 ### 构建与测试
-
-构建机需要 Inno Setup 6：
 
 ```powershell
 .\build_release.ps1 -PythonExe "C:\path\to\python.exe" -ReleaseDir "C:\path\to\release"
@@ -153,4 +153,4 @@ python -m unittest discover -s tests -v
 
 ## 许可证
 
-本项目以 [MIT License](LICENSE) 发布。Microsoft Office、LibreOffice、PyMuPDF 等第三方组件遵循各自许可条款。
+本项目以 [GNU AGPL-3.0](LICENSE) 发布。便携版包含的 PyMuPDF 使用其 GNU AGPL-3.0 许可选项；下载 EXE 的对应源码可在同一版本标签中取得。第三方组件及许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

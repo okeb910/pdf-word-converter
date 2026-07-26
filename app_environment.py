@@ -16,7 +16,7 @@ from typing import Callable, Iterable, Optional, Sequence
 
 
 APP_NAME = "PDFWordConverter"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.4.1"
 OFFICE_DOWNLOAD_URL = "https://www.microsoft.com/microsoft-365/download-office"
 LIBREOFFICE_DOWNLOAD_URL = "https://www.libreoffice.org/download/download-libreoffice/"
 
@@ -102,6 +102,7 @@ def validate_bundled_modules(
         ("docx", "python-docx"),
         ("pptx", "python-pptx"),
         ("comtypes", "comtypes"),
+        ("tkinterdnd2", "tkinterdnd2"),
     )
     failures = []
     for module_name, display_name in required:

@@ -6,5 +6,6 @@ XlsxWriter==3.2.5
 lxml==6.0.0
 typing_extensions==4.14.1
 comtypes==1.4.11
+tkinterdnd2==0.6.2
 pyinstaller==6.15.0
 pefile==2023.2.7

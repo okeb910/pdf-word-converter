@@ -5,11 +5,14 @@ from PyInstaller.utils.hooks import collect_all
 
 
 project_root = Path(SPECPATH).parent
-datas = [(str(project_root / "LICENSE"), ".")]
+datas = [
+    (str(project_root / "LICENSE"), "."),
+    (str(project_root / "THIRD_PARTY_NOTICES.md"), "."),
+]
 binaries = []
-hiddenimports = ["app_environment", "batch_logic", "conversion_specs"]
+hiddenimports = ["app_environment", "batch_logic", "conversion_specs", "drop_logic"]
 
-for package in ("pymupdf", "docx", "pptx", "PIL"):
+for package in ("pymupdf", "docx", "pptx", "PIL", "tkinterdnd2"):
     package_datas, package_binaries, package_hiddenimports = collect_all(package)
     datas += package_datas
     binaries += package_binaries
@@ -43,7 +46,7 @@ portable = EXE(
     a.binaries,
     a.datas,
     [],
-    name="PDFWordConverter-v0.4.0-Portable-x64",
+    name="PDFWordConverter-v0.4.1-Portable-x64",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -54,31 +57,4 @@ portable = EXE(
     target_arch="x86_64",
     version=str(project_root / "packaging" / "version_info.txt"),
     manifest=str(project_root / "packaging" / "app.manifest"),
-)
-
-directory_exe = EXE(
-    pyz,
-    a.scripts,
-    [],
-    exclude_binaries=True,
-    name="PDFWordConverter",
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=False,
-    console=False,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch="x86_64",
-    version=str(project_root / "packaging" / "version_info.txt"),
-    manifest=str(project_root / "packaging" / "app.manifest"),
-)
-
-COLLECT(
-    directory_exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=False,
-    name="PDFWordConverter-v0.4.0",
 )
