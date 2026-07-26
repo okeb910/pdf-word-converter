@@ -9,15 +9,19 @@ class RuntimeIntegrationTests(unittest.TestCase):
     def test_reset_engine_cache_clears_all_cached_values(self):
         converter._LO_PATH = "lo"
         converter._WORD_AVAILABLE = True
+        converter._POWERPOINT_AVAILABLE = True
         converter._LIBREOFFICE_AVAILABLE = True
         converter._PYMUPDF_AVAILABLE = True
+        converter._PPTX_COMPONENT_AVAILABLE = True
 
         converter.reset_engine_cache()
 
         self.assertIsNone(converter._LO_PATH)
         self.assertIsNone(converter._WORD_AVAILABLE)
+        self.assertIsNone(converter._POWERPOINT_AVAILABLE)
         self.assertIsNone(converter._LIBREOFFICE_AVAILABLE)
         self.assertIsNone(converter._PYMUPDF_AVAILABLE)
+        self.assertIsNone(converter._PPTX_COMPONENT_AVAILABLE)
 
     def test_word_install_refusal_never_starts_installer(self):
         app = converter.ConverterApp.__new__(converter.ConverterApp)

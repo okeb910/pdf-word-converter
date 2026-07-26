@@ -12,7 +12,7 @@ from app_environment import configure_logging, describe_module_failures, validat
 
 def show_fatal_error(message: str) -> None:
     try:
-        ctypes.windll.user32.MessageBoxW(None, message, "PDF Word Converter 启动失败", 0x10)
+        ctypes.windll.user32.MessageBoxW(None, message, "PDF Word PPT Converter 启动失败", 0x10)
     except Exception:
         print(message, file=sys.stderr)
 

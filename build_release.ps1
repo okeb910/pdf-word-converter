@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$PythonExe = "python",
     [string]$InnoCompiler = "",
     [string]$ReleaseDir = ""
@@ -55,10 +55,10 @@ finally {
 
 if ($ReleaseDir) {
     New-Item -ItemType Directory -Path $ReleaseDir -Force | Out-Null
-    $PortableSource = Join-Path $DistDir "PDFWordConverter-v0.3.0-Portable-x64.exe"
-    $SetupSource = Join-Path $DistDir "PDFWordConverter-v0.3.0-Setup-x64.exe"
-    $PortableRelease = Join-Path $ReleaseDir "PDF-Word批量转换工具-v0.3.0-便携版-x64.exe"
-    $SetupRelease = Join-Path $ReleaseDir "PDF-Word批量转换工具-v0.3.0-安装版-x64.exe"
+    $PortableSource = Join-Path $DistDir "PDFWordConverter-v0.4.0-Portable-x64.exe"
+    $SetupSource = Join-Path $DistDir "PDFWordConverter-v0.4.0-Setup-x64.exe"
+    $PortableRelease = Join-Path $ReleaseDir "PDF-Word-PPT批量转换工具-v0.4.0-便携版-x64.exe"
+    $SetupRelease = Join-Path $ReleaseDir "PDF-Word-PPT批量转换工具-v0.4.0-安装版-x64.exe"
     Copy-Item -LiteralPath $PortableSource -Destination $PortableRelease -Force
     Copy-Item -LiteralPath $SetupSource -Destination $SetupRelease -Force
     Copy-Item -LiteralPath (Join-Path $ProjectDir "packaging\README-使用说明.txt") -Destination $ReleaseDir -Force

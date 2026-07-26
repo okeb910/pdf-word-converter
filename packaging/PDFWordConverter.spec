@@ -7,9 +7,9 @@ from PyInstaller.utils.hooks import collect_all
 project_root = Path(SPECPATH).parent
 datas = [(str(project_root / "LICENSE"), ".")]
 binaries = []
-hiddenimports = ["app_environment", "batch_logic"]
+hiddenimports = ["app_environment", "batch_logic", "conversion_specs"]
 
-for package in ("pymupdf", "docx"):
+for package in ("pymupdf", "docx", "pptx", "PIL"):
     package_datas, package_binaries, package_hiddenimports = collect_all(package)
     datas += package_datas
     binaries += package_binaries
@@ -43,7 +43,7 @@ portable = EXE(
     a.binaries,
     a.datas,
     [],
-    name="PDFWordConverter-v0.3.0-Portable-x64",
+    name="PDFWordConverter-v0.4.0-Portable-x64",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -80,5 +80,5 @@ COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name="PDFWordConverter-v0.3.0",
+    name="PDFWordConverter-v0.4.0",
 )
