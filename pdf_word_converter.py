@@ -11,11 +11,20 @@ Word → PDF:
 """
 import os
 import io
+import logging
 import threading
 import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
+
+from app_environment import (
+    APP_VERSION,
+    build_install_command,
+    find_winget,
+    open_official_download,
+    run_install_command,
+)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -25,11 +34,17 @@ from pathlib import Path
 def _check_word_com_available():
     """检测 Microsoft Word 是否可通过 COM 使用"""
     try:
+        import comtypes
         import comtypes.client
-        word = comtypes.client.CreateObject("Word.Application")
-        word.Quit()
-        return True
+        comtypes.CoInitialize()
+        try:
+            word = comtypes.client.CreateObject("Word.Application", dynamic=True)
+            word.Quit()
+            return True
+        finally:
+            comtypes.CoUninitialize()
     except Exception:
+        logging.exception("Microsoft Word COM detection failed")
         return False
 
 
@@ -108,6 +123,16 @@ _LIBREOFFICE_AVAILABLE = None
 _PYMUPDF_AVAILABLE = None
 
 
+def reset_engine_cache():
+    """Clear engine detection state after an installation attempt."""
+    global _LO_PATH, _WORD_AVAILABLE, _LIBREOFFICE_AVAILABLE, _PYMUPDF_AVAILABLE
+    with _ENGINE_LOCK:
+        _LO_PATH = None
+        _WORD_AVAILABLE = None
+        _LIBREOFFICE_AVAILABLE = None
+        _PYMUPDF_AVAILABLE = None
+
+
 def word_com_available():
     global _WORD_AVAILABLE
     with _ENGINE_LOCK:
@@ -142,12 +167,18 @@ def pdf_to_word_via_word(pdf_path: str, docx_path: str, progress) -> None:
     Word 2013+ 可打开 PDF 并另存为可编辑 DOCX。
     质量通常优于纯第三方解析，但仍受 PDF 结构与本机 Word 版本影响。
     """
+    import comtypes
     import comtypes.client
     import ctypes
     import time
 
     progress("正在启动 Microsoft Word...", 5)
-    word = comtypes.client.CreateObject("Word.Application")
+    comtypes.CoInitialize()
+    try:
+        word = comtypes.client.CreateObject("Word.Application", dynamic=True)
+    except Exception:
+        comtypes.CoUninitialize()
+        raise
     word.Visible = False
     word.DisplayAlerts = 0  # wdAlertsNone
 
@@ -191,24 +222,18 @@ def pdf_to_word_via_word(pdf_path: str, docx_path: str, progress) -> None:
     try:
         progress("正在打开 PDF 文件（Word 原生解析）...", 15)
         # Word 自动识别 PDF 格式，无需指定 Format 参数
-        doc = word.Documents.Open(
-            str(Path(pdf_path).absolute()),
-            ConfirmConversions=False,
-        )
+        doc = word.Documents.Open(str(Path(pdf_path).absolute()))
 
         progress("正在转换为 Word 格式（保留完整排版）...", 50)
         # FileFormat=16 即 wdFormatDocumentDefault (.docx)
-        doc.SaveAs2(
-            str(Path(docx_path).absolute()),
-            FileFormat=16,
-            CompatibilityMode=15,
-        )
+        doc.SaveAs2(str(Path(docx_path).absolute()), 16)
         doc.Close()
         progress("正在保存...", 90)
     finally:
         stop_dismisser = True
         dismisser_thread.join(timeout=1)
         word.Quit()
+        comtypes.CoUninitialize()
     progress("完成", 100)
 
 
@@ -296,7 +321,7 @@ def pdf_to_word_via_libreoffice(pdf_path: str, docx_path: str, progress) -> None
         result = subprocess.run(
             [
                 lo, profile_arg, "--headless", "--convert-to", "docx",
-                "--outdir", str(temp_output_dir), str(pdf_path),
+                "--outdir", str(temp_output_dir), str(Path(pdf_path).absolute()),
             ],
             capture_output=True, text=True, timeout=300,
             cwd=lo_dir,
@@ -325,6 +350,19 @@ def _raise_for_libreoffice_error(result, lo_path) -> None:
     )
 
 
+def is_libreoffice_export_filter_error(error: Exception) -> bool:
+    """Identify LibreOffice PDF import/export failures suitable for image fallback."""
+    message = str(error).lower()
+    indicators = (
+        "export filter",
+        "no export filter",
+        "sfxbasemodel::impl_store",
+        "未生成预期的输出文件",
+        "source format: pdf",
+    )
+    return any(indicator in message for indicator in indicators)
+
+
 def _find_libreoffice_output(temp_dir, source_stem, suffix) -> Path:
     expected = Path(temp_dir) / f"{source_stem}{suffix}"
     if expected.is_file():
@@ -341,23 +379,30 @@ def _find_libreoffice_output(temp_dir, source_stem, suffix) -> Path:
 
 def docx_to_pdf_via_word(docx_path: str, pdf_path: str, progress) -> None:
     """通过 Microsoft Word COM 导出 PDF"""
+    import comtypes
     import comtypes.client
 
     progress("正在启动 Microsoft Word...", 5)
-    word = comtypes.client.CreateObject("Word.Application")
+    comtypes.CoInitialize()
+    try:
+        word = comtypes.client.CreateObject("Word.Application", dynamic=True)
+    except Exception:
+        comtypes.CoUninitialize()
+        raise
     word.Visible = False
     word.DisplayAlerts = 0  # wdAlertsNone
 
     try:
         progress("正在打开 Word 文档...", 15)
-        doc = word.Documents.Open(str(Path(docx_path).absolute()), ReadOnly=True)
+        doc = word.Documents.Open(str(Path(docx_path).absolute()), False, True)
 
         progress("正在导出 PDF...", 50)
         # FileFormat=17 即 wdFormatPDF
-        doc.SaveAs2(str(Path(pdf_path).absolute()), FileFormat=17)
+        doc.SaveAs2(str(Path(pdf_path).absolute()), 17)
         doc.Close()
     finally:
         word.Quit()
+        comtypes.CoUninitialize()
     progress("完成", 100)
 
 
@@ -385,7 +430,7 @@ def docx_to_pdf_via_libreoffice(docx_path: str, pdf_path: str, progress) -> None
         result = subprocess.run(
             [
                 lo, profile_arg, "--headless", "--convert-to", "pdf",
-                "--outdir", str(temp_output_dir), str(docx_path),
+                "--outdir", str(temp_output_dir), str(Path(docx_path).absolute()),
             ],
             capture_output=True, text=True, timeout=120,
             cwd=lo_dir,
@@ -544,7 +589,7 @@ class ConverterApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("PDF ↔ Word 批量转换工具（本地）")
+        self.root.title(f"PDF ↔ Word 批量转换工具 v{APP_VERSION}")
         self.root.geometry("900x760")
         self.root.minsize(780, 680)
         self.root.resizable(True, True)
@@ -558,6 +603,9 @@ class ConverterApp:
         self._method_widgets = {}
         self._engine_detection_complete = False
         self._is_converting = False
+        self._is_installing = False
+        self._winget_path = None
+        self._word_prompted = False
         self._cancel_event = threading.Event()
         self._setup_ui()
         self._detect_engines()
@@ -682,7 +730,7 @@ class ConverterApp:
         methods_desc = [
             ("word_com", "Microsoft Word 原生转换（推荐，可编辑）"),
             ("images", "页面转高清图片嵌入（观感接近，不可编辑）"),
-            ("libreoffice", "LibreOffice 引擎（免费备选）"),
+            ("libreoffice", "LibreOffice 引擎（兼容性有限）"),
         ]
         for value, description in methods_desc:
             row = tk.Frame(self.method_frame, bg="#f5f5f5")
@@ -690,6 +738,7 @@ class ConverterApp:
             radio = tk.Radiobutton(
                 row, text=description, variable=self.method_var, value=value,
                 font=("Microsoft YaHei", 9), bg="#f5f5f5", anchor="w",
+                command=lambda selected=value: self._on_method_selected(selected),
             )
             radio.pack(side="left")
             status_label = tk.Label(
@@ -746,19 +795,28 @@ class ConverterApp:
         self.log_text.pack(side="left", fill="both", expand=True)
         self._update_action_states()
 
-    def _detect_engines(self):
+    def _detect_engines(self, force=False):
+        if force:
+            reset_engine_cache()
+        self._engine_detection_complete = False
+        for label in self._method_labels.values():
+            label.config(text="检测中...", fg="#777")
+        self._update_action_states()
+
         def detect():
             have_word = word_com_available()
             have_libreoffice = libreoffice_available()
             have_pymupdf = pymupdf_available()
+            winget_path = find_winget()
             self.root.after(
                 0, self._update_engine_status,
-                have_word, have_libreoffice, have_pymupdf,
+                have_word, have_libreoffice, have_pymupdf, winget_path,
             )
 
         threading.Thread(target=detect, daemon=True).start()
 
-    def _update_engine_status(self, have_word, have_libreoffice, have_pymupdf):
+    def _update_engine_status(self, have_word, have_libreoffice, have_pymupdf, winget_path):
+        self._winget_path = winget_path
         self._avail_methods = {
             "word_com": have_word,
             "images": have_pymupdf,
@@ -778,13 +836,115 @@ class ConverterApp:
         elif have_libreoffice:
             self.method_var.set("libreoffice")
 
+        self._is_installing = False
         self._engine_detection_complete = True
         self._update_action_states()
         self.log(f"Microsoft Word: {'可用' if have_word else '不可用'}")
         self.log(f"PyMuPDF 图片模式: {'可用' if have_pymupdf else '不可用'}")
         self.log(f"LibreOffice: {'可用' if have_libreoffice else '不可用'}")
+        self.log(f"winget: {'可用' if winget_path else '不可用'}")
+
+        if not have_word and not self._word_prompted:
+            self._word_prompted = True
+            self.root.after(100, self._prompt_word_install)
+
+    def _select_best_pdf_method(self):
+        for method in ("word_com", "images", "libreoffice"):
+            if self._avail_methods.get(method):
+                self.method_var.set(method)
+                return
+
+    def _on_method_selected(self, method):
+        if method == "libreoffice" and not self._avail_methods.get("libreoffice"):
+            accepted = self._prompt_libreoffice_install()
+            if not accepted:
+                self._select_best_pdf_method()
+
+    def _prompt_word_install(self):
+        if self._avail_methods.get("word_com") or self._is_installing:
+            return False
+        confirmed = messagebox.askyesno(
+            "未检测到 Microsoft Word",
+            "是否使用 winget 安装 Microsoft Office？\n\n"
+            "Office 需要有效许可证和 Microsoft 账号，安装过程可能要求管理员权限。"
+            "程序不会自动提供许可证。",
+        )
+        if confirmed:
+            self._start_install("office")
+        else:
+            self.log("用户已拒绝安装 Microsoft Office")
+        return confirmed
+
+    def _prompt_libreoffice_install(self):
+        if self._avail_methods.get("libreoffice") or self._is_installing:
+            return False
+        confirmed = messagebox.askyesno(
+            "需要 LibreOffice",
+            "当前任务没有可用的 LibreOffice 引擎。是否使用 winget 安装官方 LibreOffice？",
+        )
+        if confirmed:
+            self._start_install("libreoffice")
+        else:
+            self.log("用户已拒绝安装 LibreOffice")
+        return confirmed
+
+    def _start_install(self, product):
+        display_name = "Microsoft Office" if product == "office" else "LibreOffice"
+        if not self._winget_path:
+            self.log(f"winget 不可用，正在打开 {display_name} 官方下载页")
+            messagebox.showwarning(
+                "winget 不可用",
+                f"当前系统未找到 winget，将打开 {display_name} 官方下载页。",
+            )
+            open_official_download(product)
+            return
+
+        self._is_installing = True
+        self._engine_detection_complete = False
+        self._update_action_states()
+        self.progress_text_var.set(f"正在安装 {display_name}...")
+        self.log(f"开始安装 {display_name}")
+        command = build_install_command(product, self._winget_path)
+
+        def install():
+            result = run_install_command(command)
+            self.root.after(0, self._finish_install, product, display_name, result)
+
+        threading.Thread(target=install, daemon=True).start()
+
+    def _finish_install(self, product, display_name, result):
+        if result.succeeded:
+            self.log(f"{display_name} 安装命令已完成，正在重新检测引擎")
+            messagebox.showinfo("安装完成", f"{display_name} 安装已完成，程序将立即重新检测。")
+            self._detect_engines(force=True)
+            return
+
+        self._is_installing = False
+        self._engine_detection_complete = True
+        self._update_action_states()
+        self.log(f"{display_name} 安装失败: {result.message}")
+        messagebox.showwarning(
+            "安装失败",
+            f"{display_name} 安装未成功。将打开官方下载页。\n\n{result.message}",
+        )
+        open_official_download(product)
+
+    def _ask_yes_no_from_worker(self, title, message):
+        completed = threading.Event()
+        answer = {"value": False}
+
+        def ask():
+            try:
+                answer["value"] = messagebox.askyesno(title, message)
+            finally:
+                completed.set()
+
+        self.root.after(0, ask)
+        completed.wait()
+        return answer["value"]
 
     def log(self, message: str):
+        logging.info(message)
         self.log_text.configure(state="normal")
         self.log_text.insert("end", f"  {message}\n")
         self.log_text.see("end")
@@ -908,13 +1068,16 @@ class ConverterApp:
         if self.batch_extension == ".pdf":
             method = self.method_var.get()
             if not self._avail_methods.get(method):
+                if method == "libreoffice":
+                    self._prompt_libreoffice_install()
+                    return
                 messagebox.showerror("转换方式不可用", "请选择一个当前可用的 PDF 转换方式")
                 return
             target_suffix = ".docx"
         elif self.batch_extension == ".docx":
             method = None
             if not (self._avail_methods.get("word_com") or self._avail_methods.get("libreoffice")):
-                messagebox.showerror("缺少转换引擎", "Word → PDF 需要 Microsoft Word 或 LibreOffice")
+                self._prompt_libreoffice_install()
                 return
             target_suffix = ".pdf"
         else:
@@ -982,10 +1145,25 @@ class ConverterApp:
                 elif method == "images":
                     pdf_to_word_via_images(source, output, progress)
                 elif method == "libreoffice":
-                    pdf_to_word_via_libreoffice(
-                        source, output,
-                        lambda message, pct: progress(message, min(88, int(pct * 0.88))),
-                    )
+                    try:
+                        pdf_to_word_via_libreoffice(
+                            source, output,
+                            lambda message, pct: progress(message, min(88, int(pct * 0.88))),
+                        )
+                    except Exception as exc:
+                        can_retry = pymupdf_available() and is_libreoffice_export_filter_error(exc)
+                        if not can_retry or not self._ask_yes_no_from_worker(
+                            "LibreOffice 转换失败",
+                            "LibreOffice 对 PDF → Word 的兼容性有限，当前文件无法导出。\n\n"
+                            "是否改用内置图片模式重试？图片模式能保留页面观感，但文字不可编辑。",
+                        ):
+                            raise
+                        output_path = Path(output)
+                        if output_path.exists():
+                            output_path.unlink()
+                        progress("改用内置图片模式重试...", 5)
+                        pdf_to_word_via_images(source, output, progress)
+                        return
                     fix_converted_docx(
                         output,
                         lambda message, pct: progress(message, min(99, max(89, pct))),
@@ -1030,13 +1208,21 @@ class ConverterApp:
             values[3] = str(result.output) if result.output and result.status != "cancelled" else ""
             self.file_tree.item(item_id, values=values, tags=(result.status,))
             self.file_tree.see(item_id)
+            item_number = self.file_tree.index(item_id) + 1
+        else:
+            item_number = 1
+
+        total = max(1, len(self.input_paths))
+        prefix = f"[{item_number}/{total}]"
 
         if result.status == "running":
-            self.log(f"开始: {result.source.name}")
+            self.log(f"{prefix} 开始: {result.source.name}")
         elif result.status == "success":
-            self.log(f"成功: {result.output}")
+            self.log(f"{prefix} 成功: {result.output}")
         elif result.status == "failed":
-            self.log(f"失败: {result.source.name} - {result.error}")
+            self.log(f"{prefix} 失败: {result.source.name} - {result.error}")
+        elif result.status == "cancelled":
+            self.log(f"{prefix} 已取消: {result.source.name}")
 
     def cancel_conversion(self):
         if not self._is_converting or self._cancel_event.is_set():
@@ -1088,7 +1274,7 @@ class ConverterApp:
         self._update_action_states()
 
     def _update_action_states(self):
-        editable_state = "disabled" if self._is_converting else "normal"
+        editable_state = "disabled" if self._is_converting or self._is_installing else "normal"
         self.select_pdf_btn.config(state=editable_state)
         self.select_docx_btn.config(state=editable_state)
         self.clear_btn.config(
@@ -1099,17 +1285,23 @@ class ConverterApp:
         )
         self.source_output_radio.config(state=editable_state)
         self.custom_output_radio.config(state=editable_state)
-        browse_enabled = not self._is_converting and self.output_mode_var.get() == "custom"
+        browse_enabled = (
+            not self._is_converting and not self._is_installing
+            and self.output_mode_var.get() == "custom"
+        )
         self.browse_output_btn.config(state="normal" if browse_enabled else "disabled")
-        can_start = self.input_paths and self._engine_detection_complete and not self._is_converting
+        can_start = (
+            self.input_paths and self._engine_detection_complete
+            and not self._is_converting and not self._is_installing
+        )
         self.convert_btn.config(state="normal" if can_start else "disabled")
         self.cancel_btn.config(state="normal" if self._is_converting else "disabled")
 
         for value, radio in self._method_widgets.items():
             enabled = (
-                not self._is_converting
+                not self._is_converting and not self._is_installing
                 and self.batch_extension != ".docx"
-                and self._avail_methods.get(value, False)
+                and (self._avail_methods.get(value, False) or value == "libreoffice")
             )
             radio.config(state="normal" if enabled else "disabled")
 

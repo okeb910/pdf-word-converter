@@ -1,5 +1,31 @@
 # PDF ↔ Word 批量转换工具
 
+## v0.3.0 免 Python 版本
+
+v0.3.0 同时提供 64 位 Windows 10/11 的便携单文件版和安装程序版。两个版本都内置 Python 3.12、Tkinter、PyMuPDF、python-docx 和 comtypes，目标电脑不需要安装 Python，启动时也不会执行 pip。
+
+- `PDF-Word批量转换工具-v0.3.0-便携版-x64.exe`：直接双击运行。
+- `PDF-Word批量转换工具-v0.3.0-安装版-x64.exe`：按当前用户安装到 `%LOCALAPPDATA%\Programs\PDFWordConverter`，带开始菜单快捷方式和卸载项。
+- 每次启动都会在后台检测内置组件、Microsoft Word、LibreOffice 和 winget，检测过程不阻塞主窗口。
+- 未检测到 Word 时，每次进程最多询问一次是否通过 winget 安装 Microsoft Office；Office 仍需要有效许可证和 Microsoft 账号，并可能要求管理员权限。
+- LibreOffice 不会在启动时主动提示，只在选择 LibreOffice 或 Word → PDF 没有可用引擎时询问安装。
+- 安装命令只会在用户确认后以参数列表执行；winget 不可用或安装失败时打开官方页面。
+- 启动和环境检测日志位于 `%LOCALAPPDATA%\PDFWordConverter\logs`。
+
+LibreOffice 的 PDF → Word 支持标记为“兼容性有限”。遇到无导出过滤器时，程序会询问是否改用内置图片模式重试。
+
+### 本地构建
+
+构建机需要 Python 3.12 x64 和 Inno Setup 6；这些工具不会安装到目标电脑。固定版本依赖见 `requirements-build.txt`：
+
+```powershell
+.\build_release.ps1 -PythonExe "C:\path\to\python.exe" -ReleaseDir "C:\path\to\release"
+```
+
+PyInstaller 配置、Windows manifest、版本资源、简体中文安装语言文件和 Inno Setup 脚本位于 `packaging/`。
+
+---
+
 本地运行的 **PDF 与 Word（.docx）双向批量转换** 桌面工具。
 优先调用本机 **Microsoft Word** 做转换，并提供 **整页图片嵌入**、**LibreOffice** 作为备选路径。
 
@@ -103,6 +129,11 @@ Word → PDF 使用相同编号规则，只是扩展名改为 `.pdf`。
 .
 ├── pdf_word_converter.py   # 转换引擎、后处理与 GUI
 ├── batch_logic.py          # 输出编号与可测试的串行批次调度
+├── app_environment.py      # 冻结环境检测与按需安装命令
+├── launcher.py             # 打包版启动检查与错误日志
+├── build_release.ps1       # 本地 v0.3.0 构建脚本
+├── requirements-build.txt  # Python 3.12 固定构建依赖
+├── packaging/              # PyInstaller、manifest、版本资源、Inno Setup
 ├── tests/                  # 批次逻辑自动化测试
 ├── requirements.txt        # Python 依赖
 ├── 启动转换工具.bat         # Windows 一键检查依赖并启动
