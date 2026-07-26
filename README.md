@@ -17,7 +17,7 @@ v0.4.0 只发布便携版。请从 [GitHub Releases](https://github.com/okeb910/
 
 | 文件 | 说明 |
 |------|------|
-| `PDF-Word-PPT批量转换工具-v0.4.0-便携版-x64.exe` | **主程序**：下载后直接双击运行，无需安装 |
+| `PDF-Word-PPT-Converter-v0.4.0-Portable-x64.exe` | **主程序**：下载后直接双击运行，无需安装 |
 | `SHA256SUMS.txt` | 便携版 EXE 的 SHA-256 校验值 |
 
 - 支持 **64 位 Windows 10 / 11**。
