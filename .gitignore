@@ -33,3 +33,4 @@ Thumbs.db
 
 # Local source sample used for manual conversion checks.
 _test_original.pdf
+.pytest_cache/
