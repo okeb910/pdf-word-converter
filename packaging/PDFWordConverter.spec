@@ -8,11 +8,20 @@ project_root = Path(SPECPATH).parent
 datas = [
     (str(project_root / "LICENSE"), "."),
     (str(project_root / "THIRD_PARTY_NOTICES.md"), "."),
+    (str(project_root / "packaging" / "licenses"), "licenses"),
 ]
 binaries = []
-hiddenimports = ["app_environment", "batch_logic", "conversion_specs", "drop_logic"]
+hiddenimports = [
+    "app_environment",
+    "batch_logic",
+    "conversion_specs",
+    "drop_logic",
+    "engine_models",
+    "macos_office",
+    "platform_services",
+]
 
-for package in ("pymupdf", "docx", "pptx", "PIL", "tkinterdnd2"):
+for package in ("pymupdf", "docx", "pptx", "PIL"):
     package_datas, package_binaries, package_hiddenimports = collect_all(package)
     datas += package_datas
     binaries += package_binaries
@@ -46,7 +55,7 @@ portable = EXE(
     a.binaries,
     a.datas,
     [],
-    name="PDFWordConverter-v0.4.1-Portable-x64",
+    name="PDF-Word-PPT批量转换工具-v0.5.0-便携版-x64",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -1,6 +1,7 @@
 import tempfile
 import threading
 import unittest
+import unicodedata
 from pathlib import Path
 
 from batch_logic import deduplicate_paths, resolve_output_path, run_conversion_batch
@@ -41,9 +42,38 @@ class OutputPathTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             first = Path(tmp) / "first.pdf"
             second = Path(tmp) / "second.pdf"
+            first.touch()
+            second.touch()
             self.assertEqual(
                 deduplicate_paths([first, second, first]),
                 [first.absolute(), second.absolute()],
+            )
+
+    def test_deduplicates_unicode_nfc_and_nfd_fallback_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            composed = Path(tmp) / "résumé.pdf"
+            decomposed = Path(tmp) / unicodedata.normalize("NFD", composed.name)
+
+            self.assertNotEqual(str(composed), str(decomposed))
+            self.assertEqual(
+                deduplicate_paths([decomposed, composed]),
+                [decomposed.absolute()],
+            )
+
+    def test_deduplicates_symbolic_link_to_existing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            source = folder / "source.pdf"
+            alias = folder / "alias.pdf"
+            source.touch()
+            try:
+                alias.symlink_to(source)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"当前平台不允许创建符号链接: {exc}")
+
+            self.assertEqual(
+                deduplicate_paths([alias, source, alias]),
+                [alias.absolute()],
             )
 
 

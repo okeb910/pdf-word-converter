@@ -1,8 +1,11 @@
 import subprocess
+import tempfile
 import unittest
-from unittest.mock import Mock
+from pathlib import Path
+from unittest.mock import Mock, patch
 
 import app_environment as environment
+from platform_services import DarwinPlatformServices, WindowsPlatformServices
 
 
 class EnvironmentTests(unittest.TestCase):
@@ -25,6 +28,73 @@ class EnvironmentTests(unittest.TestCase):
             environment.validate_bundled_modules(importer),
             ["python-docx: broken"],
         )
+
+    def test_darwin_validation_does_not_require_windows_or_drag_drop_modules(self):
+        imported = []
+
+        def importer(name):
+            imported.append(name)
+            if name in {"comtypes", "tkinterdnd2"}:
+                raise ImportError("platform-specific module must not be required")
+            module = Mock()
+            if name == "pymupdf":
+                module.open = Mock()
+            return module
+
+        services = DarwinPlatformServices(platform="darwin", env={})
+        self.assertEqual(
+            environment.validate_bundled_modules(importer, services=services),
+            [],
+        )
+        self.assertNotIn("comtypes", imported)
+        self.assertNotIn("tkinterdnd2", imported)
+
+    def test_windows_validation_requires_comtypes_but_not_drag_drop_module(self):
+        imported = []
+
+        def importer(name):
+            imported.append(name)
+            if name in {"comtypes", "tkinterdnd2"}:
+                raise ImportError(f"missing {name}")
+            module = Mock()
+            if name == "pymupdf":
+                module.open = Mock()
+            return module
+
+        services = WindowsPlatformServices(platform="win32", env={})
+        self.assertEqual(
+            environment.validate_bundled_modules(importer, services=services),
+            ["comtypes: missing comtypes"],
+        )
+        self.assertIn("comtypes", imported)
+        self.assertNotIn("tkinterdnd2", imported)
+
+    def test_macos_module_failure_message_points_to_source_repair(self):
+        services = DarwinPlatformServices(platform="darwin", env={})
+        message = environment.describe_module_failures(
+            ["PyMuPDF: broken"], services
+        )
+
+        self.assertIn("启动工具.command", message)
+        self.assertIn("requirements-macos.txt", message)
+        self.assertNotIn("便携版", message)
+
+    def test_configure_logging_uses_injected_platform_log_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_dir = Path(temp_dir) / "custom-platform-logs"
+            services = Mock()
+            services.ensure_log_dir.return_value = log_dir
+            handler = Mock()
+
+            with patch.object(environment.logging, "FileHandler", return_value=handler) as file_handler, patch.object(
+                environment.logging, "basicConfig"
+            ) as basic_config, patch.object(environment.logging, "info"):
+                log_path = environment.configure_logging(services)
+
+            services.ensure_log_dir.assert_called_once_with()
+            self.assertEqual(log_path.parent, log_dir)
+            file_handler.assert_called_once_with(log_path, encoding="utf-8")
+            self.assertEqual(basic_config.call_args.kwargs["handlers"], [handler])
 
     def test_exact_office_command(self):
         self.assertEqual(

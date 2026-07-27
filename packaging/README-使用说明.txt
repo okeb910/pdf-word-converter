@@ -1,4 +1,4 @@
-PDF ↔ Word/PPT 批量转换工具 v0.4.1 使用说明
+PDF ↔ Word/PPT 批量转换工具 v0.5.0 Windows 便携版使用说明
 ==========================================
 
 系统要求
@@ -9,7 +9,7 @@ PDF ↔ Word/PPT 批量转换工具 v0.4.1 使用说明
 
 启动与添加文件
 --------------
-- 双击 PDF-Word-PPT批量转换工具-v0.4.1-便携版-x64.exe。
+- 双击 PDF-Word-PPT批量转换工具-v0.5.0-便携版-x64.exe。
 - 可点击添加按钮，也可把 PDF、DOCX、PPT 或 PPTX 拖入转换队列。
 - PDF 可直接拖到“PDF → Word”或“PDF → PowerPoint”目标块。
 - Word/PPT 拖入普通队列后自动转换为 PDF。
@@ -26,8 +26,9 @@ PDF ↔ Word/PPT 批量转换工具 v0.4.1 使用说明
 环境检测
 --------
 - Word、PowerPoint、LibreOffice、内置组件和 winget 会并行检测并逐项显示。
+- Word、PowerPoint 和 LibreOffice 只做注册或路径浅检测，不会在启动时打开外部程序。
+- 已发现的外部引擎会在首次实际转换时验证，因此启动检测通常很快。
 - 当前转换方向所需检测完成后即可操作，不等待无关引擎。
-- 深度检测会实际启动并关闭本机 Office/LibreOffice，耗时取决于电脑性能。
 - 启动检测不会主动要求安装 Office；只有真正缺少所选引擎时才提示。
 - Office 需要许可证和 Microsoft 账号，程序不会提供许可证。
 
@@ -52,4 +53,9 @@ PDF → PowerPoint 说明
 校验
 ----
 SHA256SUMS.txt 包含便携版 EXE 的 SHA-256，可用 PowerShell 核对：
-Get-FileHash '.\PDF-Word-PPT批量转换工具-v0.4.1-便携版-x64.exe' -Algorithm SHA256
+Get-FileHash '.\PDF-Word-PPT批量转换工具-v0.5.0-便携版-x64.exe' -Algorithm SHA256
+
+许可证
+------
+本项目以 GNU AGPL-3.0 发布，并采用 PyMuPDF 的 AGPL 许可选项。
+第三方组件说明见同目录 THIRD_PARTY_NOTICES.md；若公开分发，应在同一 GitHub 仓库和版本标签提供对应源码。

@@ -6,6 +6,7 @@ __pycache__/
 .Python
 .venv/
 .venv-build/
+.venv-macos/
 venv/
 env/
 .env
@@ -13,6 +14,7 @@ env/
 .eggs/
 dist/
 build/
+release/
 tmp/
 *.egg
 
@@ -29,5 +31,5 @@ Thumbs.db
 *_converted.pdf
 *.tmp
 
-# Optional: ignore ad-hoc local test PDFs at repo root (rename/move to examples/ if you want them tracked)
-# _test_original.pdf
+# Local source sample used for manual conversion checks.
+_test_original.pdf

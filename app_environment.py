@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import importlib
 import logging
-import os
 import shutil
 import subprocess
 import sys
@@ -14,11 +13,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Sequence
 
+from platform_services import (
+    LIBREOFFICE_DOWNLOAD_URL,
+    OFFICE_DOWNLOAD_URL,
+    PlatformServices,
+    create_platform_services,
+)
+
 
 APP_NAME = "PDFWordConverter"
-APP_VERSION = "0.4.1"
-OFFICE_DOWNLOAD_URL = "https://www.microsoft.com/microsoft-365/download-office"
-LIBREOFFICE_DOWNLOAD_URL = "https://www.libreoffice.org/download/download-libreoffice/"
+APP_VERSION = "0.5.0"
 
 OFFICE_WINGET_COMMAND = (
     "winget",
@@ -65,15 +69,18 @@ def bundled_runtime_root() -> Path:
 
 
 def local_app_data() -> Path:
+    """Compatibility helper retained for the Windows portable build."""
+    import os
+
     value = os.environ.get("LOCALAPPDATA")
     if value:
         return Path(value)
     return Path.home() / "AppData" / "Local"
 
 
-def configure_logging() -> Path:
-    log_dir = local_app_data() / APP_NAME / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
+def configure_logging(services: Optional[PlatformServices] = None) -> Path:
+    services = services or create_platform_services()
+    log_dir = services.ensure_log_dir()
     log_path = log_dir / f"startup-{datetime.now():%Y%m%d}.log"
     logging.basicConfig(
         level=logging.INFO,
@@ -94,16 +101,11 @@ def configure_logging() -> Path:
 
 def validate_bundled_modules(
     importer: Callable[[str], object] = importlib.import_module,
+    services: Optional[PlatformServices] = None,
 ) -> list[str]:
     """Return user-facing names of missing or damaged embedded modules."""
-    required = (
-        ("tkinter", "Tkinter"),
-        ("pymupdf", "PyMuPDF"),
-        ("docx", "python-docx"),
-        ("pptx", "python-pptx"),
-        ("comtypes", "comtypes"),
-        ("tkinterdnd2", "tkinterdnd2"),
-    )
+    services = services or create_platform_services()
+    required = services.required_modules
     failures = []
     for module_name, display_name in required:
         try:
@@ -172,10 +174,21 @@ def open_official_download(product: str, opener: Callable[[str], object] = webbr
     return url
 
 
-def describe_module_failures(failures: Iterable[str]) -> str:
+def describe_module_failures(
+    failures: Iterable[str],
+    services: Optional[PlatformServices] = None,
+) -> str:
     lines = list(failures)
+    platform_name = getattr(services, "platform", sys.platform)
+    if platform_name == "darwin":
+        recovery = (
+            "请重新双击“启动工具.command”修复依赖，或按 README 中的终端命令"
+            "重新安装 requirements-macos.txt。"
+        )
+    else:
+        recovery = "请重新下载完整的便携版程序。"
     return (
         "程序内置组件缺失或损坏，无法启动。\n\n"
         + "\n".join(f"- {line}" for line in lines)
-        + "\n\n请重新下载安装完整的便携版，或重新运行安装程序。"
+        + f"\n\n{recovery}"
     )

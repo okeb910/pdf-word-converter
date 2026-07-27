@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from engine_models import EngineState
 import pdf_word_converter as converter
 from drop_logic import MixedSourceKindsError, classify_dropped_paths
 
@@ -243,6 +244,39 @@ class ParallelDetectionTests(unittest.TestCase):
         app._update_method_panel = Mock()
         app._update_action_states = Mock()
         return app
+
+    def test_windows_office_startup_probes_do_not_launch_office(self):
+        with patch.object(converter.sys, "platform", "win32"), patch.object(
+            converter, "_com_application_registered", return_value=True
+        ) as registered, patch.object(converter.subprocess, "run") as run:
+            word_status = converter._check_word_com_available()
+            powerpoint_status = converter._check_powerpoint_com_available()
+
+        self.assertIs(word_status.state, EngineState.UNVERIFIED)
+        self.assertIs(powerpoint_status.state, EngineState.UNVERIFIED)
+        self.assertTrue(converter._status_selectable(word_status))
+        self.assertTrue(converter._status_selectable(powerpoint_status))
+        self.assertEqual(registered.call_count, 2)
+        run.assert_not_called()
+
+    def test_missing_windows_office_registration_is_not_selectable(self):
+        with patch.object(converter.sys, "platform", "win32"), patch.object(
+            converter, "_com_application_registered", return_value=False
+        ):
+            status = converter._check_word_com_available()
+
+        self.assertIs(status.state, EngineState.MISSING)
+        self.assertFalse(converter._status_selectable(status))
+
+    def test_libreoffice_startup_probe_only_checks_the_executable_path(self):
+        with patch.object(
+            converter, "_get_lo_path", return_value="/Applications/LibreOffice/soffice"
+        ), patch.object(converter.subprocess, "run") as run:
+            status = converter._check_libreoffice_available()
+
+        self.assertIs(status.state, EngineState.UNVERIFIED)
+        self.assertTrue(converter._status_selectable(status))
+        run.assert_not_called()
 
     def test_engine_cache_wrappers_do_not_serialize_different_engines(self):
         word = BlockingProbe()

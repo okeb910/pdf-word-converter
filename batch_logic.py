@@ -2,6 +2,7 @@
 
 import os
 import threading
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence
@@ -16,15 +17,34 @@ class BatchResult:
 
 
 def deduplicate_paths(paths: Sequence[Path]) -> List[Path]:
-    """按规范化绝对路径去重，同时保留用户的选择顺序。"""
+    """按文件身份或规范化绝对路径去重，同时保留用户的选择顺序。"""
     result = []
-    seen = set()
+    seen_files = set()
+    seen_paths = set()
     for path in paths:
         normalized = Path(path).expanduser().absolute()
-        key = os.path.normcase(os.path.normpath(str(normalized)))
-        if key not in seen:
-            seen.add(key)
-            result.append(normalized)
+        try:
+            stat_result = normalized.stat()
+            inode = getattr(stat_result, "st_ino", 0)
+            device = getattr(stat_result, "st_dev", 0)
+            file_key = (device, inode) if inode else None
+        except OSError:
+            file_key = None
+
+        if file_key is not None:
+            if file_key in seen_files:
+                continue
+            seen_files.add(file_key)
+        else:
+            path_key = unicodedata.normalize(
+                "NFC",
+                os.path.normcase(os.path.normpath(str(normalized))),
+            )
+            if path_key in seen_paths:
+                continue
+            seen_paths.add(path_key)
+
+        result.append(normalized)
     return result
 
 

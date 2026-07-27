@@ -1,0 +1,114 @@
+name: Cross-platform source tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-source-tests:
+    name: Windows / Python 3.12
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install source dependencies
+        run: python -m pip install --requirement requirements.txt
+
+      - name: Run complete test suite
+        run: python -m unittest discover -s tests -v
+
+  macos-source-tests:
+    name: macOS ${{ matrix.arch }} / Python 3.12
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Assert runner architecture
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import platform
+
+          expected = "${{ matrix.arch }}"
+          actual = platform.machine().lower()
+          assert actual == expected, f"expected {expected}, got {actual}"
+          print(f"runner architecture: {actual}")
+          PY
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-macos.txt
+
+      - name: Confirm Python architecture
+        shell: bash
+        run: |
+          python - <<'PY'
+          import platform
+          import struct
+
+          expected = "${{ matrix.arch }}"
+          actual = platform.machine().lower()
+          assert actual == expected, f"expected {expected}, got {actual}"
+          assert struct.calcsize("P") * 8 == 64, "Python must be 64-bit"
+          print(f"Python {platform.python_version()} / {actual} / 64-bit")
+          PY
+
+      - name: Install macOS source dependencies
+        run: python -m pip install --requirement requirements-macos.txt
+
+      - name: Check Finder launcher metadata and syntax
+        shell: bash
+        run: |
+          test -x "./启动工具.command"
+          python - <<'PY'
+          from pathlib import Path
+
+          data = Path("启动工具.command").read_bytes()
+          assert not data.startswith(b"\xef\xbb\xbf"), "launcher must not contain a UTF-8 BOM"
+          assert b"\r\n" not in data, "launcher must use LF line endings"
+          PY
+          bash -n "./启动工具.command"
+
+      - name: Strictly import Tk and TkDND
+        shell: bash
+        run: |
+          python - <<'PY'
+          import tkinter
+          import tkinterdnd2
+
+          assert tkinter.TkVersion >= 8.6
+          assert tkinterdnd2.TkinterDnD is not None
+          print(f"Tk {tkinter.TkVersion}; tkinterdnd2 imported")
+          PY
+
+      - name: Run complete test suite
+        run: python -m unittest discover -s tests -v
+
+      - name: Smoke-test GUI startup and shutdown
+        run: python tests/gui_smoke.py
+        timeout-minutes: 1

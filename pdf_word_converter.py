@@ -2,33 +2,33 @@
 PDF ↔ Word/PowerPoint 互相转换工具
 
 PDF → Word:
-  - Microsoft Word 原生转换（推荐，质量通常较好，仍依赖本机 Word）
+  - Windows Microsoft Word 原生转换（推荐，质量通常较好）
   - 整页渲染为图片嵌入 DOCX（视觉接近，文字一般不可编辑）
   - LibreOffice 无头转换（免费备选）
 
 Word → PDF:
-  - 优先 Microsoft Word COM，不可用时回退 LibreOffice
+  - Windows 使用 Word COM，macOS 使用 Word AppleScript，均可回退 LibreOffice
 
 PDF → PowerPoint:
   - 每页自适应高清渲染为整页图片，外观稳定但元素不可编辑
 
 PowerPoint → PDF:
-  - 优先 Microsoft PowerPoint COM，不可用时回退 LibreOffice
+  - Windows 使用 PowerPoint COM，macOS 使用 PowerPoint AppleScript，均可回退 LibreOffice
 """
 import os
 import io
 import logging
-import threading
 import sys
+import threading
 import subprocess
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 from pathlib import Path
 
 try:
     from tkinterdnd2 import COPY, DND_FILES, REFUSE_DROP, TkinterDnD
-except Exception:
+except Exception:  # Drag and drop is optional; standard Tk remains usable.
     COPY = "copy"
     DND_FILES = None
     REFUSE_DROP = "refuse_drop"
@@ -41,12 +41,56 @@ from app_environment import (
     open_official_download,
     run_install_command,
 )
+from engine_models import EngineState, EngineStatus
 from conversion_specs import (
     PDF_TARGET_POWERPOINT,
     PDF_TARGET_WORD,
     resolve_conversion_spec,
 )
 from drop_logic import MixedSourceKindsError, classify_dropped_paths
+from macos_office import MacOSOfficeError, MacOSPowerPointBackend, MacOSWordBackend
+from platform_services import InstallerActionKind, create_platform_services
+
+
+PLATFORM_SERVICES = create_platform_services()
+IS_MACOS = PLATFORM_SERVICES.platform == "darwin"
+WORD_NATIVE = "word_native"
+POWERPOINT_NATIVE = "powerpoint_native"
+LEGACY_ENGINE_ALIASES = {
+    "word_com": WORD_NATIVE,
+    "powerpoint_com": POWERPOINT_NATIVE,
+}
+
+
+def _canonical_engine_key(key: str) -> str:
+    return LEGACY_ENGINE_ALIASES.get(key, key)
+
+
+def _coerce_engine_status(result, error=None) -> EngineStatus:
+    if isinstance(result, EngineStatus):
+        return result
+    if error:
+        return EngineStatus(EngineState.LAUNCH_FAILED, str(error))
+    return EngineStatus(
+        EngineState.AVAILABLE if bool(result) else EngineState.MISSING,
+    )
+
+
+def _status_selectable(status: EngineStatus) -> bool:
+    return status.state in {EngineState.AVAILABLE, EngineState.UNVERIFIED}
+
+
+def _availability_from_result(result, error=None):
+    """Map a probe result to the tri-state value consumed by the UI."""
+    status = _coerce_engine_status(result, error)
+    if status.state is EngineState.CHECKING:
+        return None
+    return _status_selectable(status)
+
+
+def _engine_result_selectable(result) -> bool:
+    """Return whether a cached/probed engine result may be used for conversion."""
+    return _status_selectable(_coerce_engine_status(result))
 
 
 # ═══════════════════════════════════════════════════════════
@@ -54,39 +98,32 @@ from drop_logic import MixedSourceKindsError, classify_dropped_paths
 # ═══════════════════════════════════════════════════════════
 
 def _check_word_com_available():
-    """检测 Microsoft Word 是否可通过 COM 使用"""
-    try:
-        import comtypes
-        import comtypes.client
-        comtypes.CoInitialize()
-        try:
-            word = comtypes.client.CreateObject("Word.Application", dynamic=True)
-            word.Quit()
-            return True
-        finally:
-            comtypes.CoUninitialize()
-    except Exception:
-        logging.exception("Microsoft Word COM detection failed")
-        return False
+    """Detect Word registration without launching Office during startup."""
+    if sys.platform != "win32":
+        return EngineStatus(EngineState.UNSUPPORTED, "当前平台不支持 Microsoft Word COM")
+    if not _com_application_registered("Word.Application"):
+        return EngineStatus(EngineState.MISSING, "未检测到 Microsoft Word COM 注册")
+    return EngineStatus(
+        EngineState.UNVERIFIED,
+        "已检测到 Microsoft Word，首次转换时验证 COM",
+    )
 
 
 def _check_powerpoint_com_available():
-    """检测 Microsoft PowerPoint 是否可通过 COM 使用。"""
-    try:
-        import comtypes
-        import comtypes.client
-        comtypes.CoInitialize()
-        try:
-            powerpoint = comtypes.client.CreateObject("PowerPoint.Application", dynamic=True)
-            powerpoint.Quit()
-            return True
-        finally:
-            comtypes.CoUninitialize()
-    except Exception:
-        logging.exception("Microsoft PowerPoint COM detection failed")
-        return False
+    """Detect PowerPoint registration without launching Office during startup."""
+    if sys.platform != "win32":
+        return EngineStatus(EngineState.UNSUPPORTED, "当前平台不支持 Microsoft PowerPoint COM")
+    if not _com_application_registered("PowerPoint.Application"):
+        return EngineStatus(EngineState.MISSING, "未检测到 Microsoft PowerPoint COM 注册")
+    return EngineStatus(
+        EngineState.UNVERIFIED,
+        "已检测到 Microsoft PowerPoint，首次转换时验证 COM",
+    )
+
+
+
 def _com_application_registered(prog_id: str) -> bool:
-    """Check Office COM registration without opening the application."""
+    """Check COM registration without starting the Office application."""
     if sys.platform != "win32":
         return False
     try:
@@ -98,23 +135,10 @@ def _com_application_registered(prog_id: str) -> bool:
     except (ImportError, OSError):
         return False
 
-
 def _find_libreoffice():
-    """查找 LibreOffice 可执行文件路径"""
-    import shutil
-    # 1. 先检查 PATH 中的 libreoffice / soffice
-    for name in ["libreoffice", "soffice"]:
-        if shutil.which(name):
-            return name
-    # 2. 检查常见安装位置（Windows）
-    import platform
-    if platform.system() == "Windows":
-        for base in [r"C:\Program Files\LibreOffice",
-                     r"C:\Program Files (x86)\LibreOffice"]:
-            soffice = os.path.join(base, "program", "soffice.exe")
-            if os.path.exists(soffice):
-                return soffice
-    return None
+    """查找当前平台的 LibreOffice 可执行文件路径。"""
+    path = PLATFORM_SERVICES.find_libreoffice()
+    return str(path) if path else None
 
 _LO_PATH = None  # 缓存找到的 LibreOffice 路径
 
@@ -125,24 +149,14 @@ def _get_lo_path():
     return _LO_PATH
 
 def _check_libreoffice_available():
-    """用隔离的临时配置检测 LibreOffice 无头模式。"""
-    import tempfile
-
+    """Detect LibreOffice without launching it during application startup."""
     lo = _get_lo_path()
     if not lo:
-        return False
-    lo_dir = os.path.dirname(lo) or None
-    try:
-        with tempfile.TemporaryDirectory(prefix="pdf_word_converter_detect_") as profile_dir:
-            profile_arg = f"-env:UserInstallation={Path(profile_dir).as_uri()}"
-            result = subprocess.run(
-                [lo, profile_arg, "--headless", "--terminate_after_init"],
-                capture_output=True, text=True, timeout=20,
-                cwd=lo_dir,
-            )
-        return result.returncode == 0
-    except Exception:
-        return False
+        return EngineStatus(EngineState.MISSING, "未检测到 LibreOffice 可执行文件")
+    return EngineStatus(
+        EngineState.UNVERIFIED,
+        f"已检测到 LibreOffice：{lo}；首次转换时验证",
+    )
 
 
 def _load_pymupdf():
@@ -176,7 +190,7 @@ def _check_pptx_component_available():
         return False
 
 
-# 缓存检测结果（加锁防竞态）
+# 每个引擎独立缓存和锁，允许启动检测真正并行执行。
 _WORD_LOCK = threading.Lock()
 _POWERPOINT_LOCK = threading.Lock()
 _LIBREOFFICE_LOCK = threading.Lock()
@@ -196,9 +210,10 @@ _PPTX_COMPONENT_AVAILABLE = None
 
 
 def reset_engine_cache():
-    """Invalidate cached checks without waiting for an older probe."""
-    global _ENGINE_CACHE_GENERATION, _LO_PATH, _WORD_AVAILABLE, _POWERPOINT_AVAILABLE
-    global _LIBREOFFICE_AVAILABLE, _PYMUPDF_AVAILABLE, _PPTX_COMPONENT_AVAILABLE
+    """Invalidate cached checks without waiting for an older probe to finish."""
+    global _ENGINE_CACHE_GENERATION, _LO_PATH
+    global _WORD_AVAILABLE, _POWERPOINT_AVAILABLE, _LIBREOFFICE_AVAILABLE
+    global _PYMUPDF_AVAILABLE, _PPTX_COMPONENT_AVAILABLE
     _ENGINE_CACHE_GENERATION += 1
     _LO_PATH = None
     _WORD_AVAILABLE = None
@@ -297,6 +312,7 @@ def pdf_to_word_via_word(pdf_path: str, docx_path: str, progress) -> None:
         raise
     word.Visible = False
     word.DisplayAlerts = 0  # wdAlertsNone
+    doc = None
 
     # 后台线程：自动关闭 Word 可能弹出的 PDF 转换进度对话框
     stop_dismisser = False
@@ -343,13 +359,21 @@ def pdf_to_word_via_word(pdf_path: str, docx_path: str, progress) -> None:
         progress("正在转换为 Word 格式（保留完整排版）...", 50)
         # FileFormat=16 即 wdFormatDocumentDefault (.docx)
         doc.SaveAs2(str(Path(docx_path).absolute()), 16)
-        doc.Close()
         progress("正在保存...", 90)
     finally:
         stop_dismisser = True
         dismisser_thread.join(timeout=1)
-        word.Quit()
-        comtypes.CoUninitialize()
+        if doc is not None:
+            try:
+                doc.Close(False)
+            except Exception:
+                logging.exception("Could not close Word PDF document")
+        try:
+            word.Quit()
+        except Exception:
+            logging.exception("Could not quit Word after PDF conversion")
+        finally:
+            comtypes.CoUninitialize()
     progress("完成", 100)
 
 
@@ -425,9 +449,9 @@ def pdf_to_word_via_images(pdf_path: str, docx_path: str, progress, dpi: int = 3
             section = word_doc.sections[0]
             para = word_doc.add_paragraph()
         else:
-            # add_section() 会同时创建新 section 和一个空段落，直接用该段落
+            # 分节符段落属于前一节；图片必须放到它后面的新段落。
             section = word_doc.add_section()
-            para = word_doc.paragraphs[-1]
+            para = word_doc.add_paragraph()
 
         section.page_width = Inches(page_w_inch)
         section.page_height = Inches(page_h_inch)
@@ -634,6 +658,7 @@ def docx_to_pdf_via_word(docx_path: str, pdf_path: str, progress) -> None:
         raise
     word.Visible = False
     word.DisplayAlerts = 0  # wdAlertsNone
+    doc = None
 
     try:
         progress("正在打开 Word 文档...", 15)
@@ -642,10 +667,18 @@ def docx_to_pdf_via_word(docx_path: str, pdf_path: str, progress) -> None:
         progress("正在导出 PDF...", 50)
         # FileFormat=17 即 wdFormatPDF
         doc.SaveAs2(str(Path(pdf_path).absolute()), 17)
-        doc.Close()
     finally:
-        word.Quit()
-        comtypes.CoUninitialize()
+        if doc is not None:
+            try:
+                doc.Close(False)
+            except Exception:
+                logging.exception("Could not close Word document")
+        try:
+            word.Quit()
+        except Exception:
+            logging.exception("Could not quit Word after PDF export")
+        finally:
+            comtypes.CoUninitialize()
     progress("完成", 100)
 
 
@@ -876,48 +909,78 @@ class ConverterApp:
         "cancelled": "已取消",
     }
 
-    def __init__(self, root):
+    def __init__(self, root, platform_services=None):
         self.root = root
+        self.platform_services = platform_services or PLATFORM_SERVICES
+        self.is_macos = self.platform_services.platform == "darwin"
+        self._mac_word_backend = None
+        self._mac_powerpoint_backend = None
+        if self.is_macos:
+            self._mac_word_backend = MacOSWordBackend(
+                installed_checker=lambda: self.platform_services.native_app_installed("word")
+            )
+            self._mac_powerpoint_backend = MacOSPowerPointBackend(
+                installed_checker=lambda: self.platform_services.native_app_installed("powerpoint")
+            )
+
         self.root.title(f"PDF ↔ Word/PPT 批量转换工具 v{APP_VERSION}")
         self.root.geometry("960x820")
         self.root.minsize(840, 720)
         self.root.resizable(True, True)
         self.root.configure(bg="#f5f5f5")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_window_close)
+        self.ui_font_family = tkfont.nametofont("TkDefaultFont").actual("family")
+        self.mono_font_family = tkfont.nametofont("TkFixedFont").actual("family")
 
         self.input_paths = []
         self.source_kind = None
         self.output_paths = []
         self._tree_paths = {}
-        self._avail_methods = {}
+        self._avail_methods = {
+            WORD_NATIVE: None,
+            POWERPOINT_NATIVE: None,
+            "word_com": None,
+            "powerpoint_com": None,
+            "images": None,
+            "pptx": None,
+            "libreoffice": None,
+        }
+        self._engine_statuses = {
+            key: EngineStatus(EngineState.CHECKING)
+            for key in (WORD_NATIVE, POWERPOINT_NATIVE, "images", "pptx", "libreoffice")
+        }
         self._method_widgets = {}
         self._engine_detection_complete = False
+        self._engine_generation = 0
+        self._install_detection_generation = None
+        self._pending_engine_checks = set()
+        self._engine_elapsed_ms = {}
+        self._word_registered = False
+        self._powerpoint_registered = False
+        self._libreoffice_detected = False
         self._is_converting = False
         self._is_installing = False
         self._winget_path = None
         self._cancel_event = threading.Event()
+        self._close_after_batch = False
         self._setup_ui()
-        self._setup_drag_and_drop()
         self._detect_engines()
 
     def _setup_ui(self):
         title = tk.Label(
             self.root, text="PDF ↔ Word/PPT 批量转换工具",
-            font=("Microsoft YaHei", 18, "bold"), bg="#f5f5f5", fg="#222",
+            font=(self.ui_font_family, 18, "bold"), bg="#f5f5f5", fg="#222",
         )
-        title.pack(pady=(16, 4))
+        title.pack(pady=(10, 2))
 
         tk.Label(
             self.root, text="本地串行转换 · 支持批量队列 · 文件不会上传",
-            font=("Microsoft YaHei", 10), bg="#f5f5f5", fg="#666",
-        ).pack(pady=(0, 12))
-        tk.Label(
-            self.root, text="Copyright (c) 2026 okeb910 · AGPL-3.0 · github.com/okeb910/pdf-word-converter",
-            font=("Microsoft YaHei", 8), bg="#f5f5f5", fg="#666",
+            font=(self.ui_font_family, 10), bg="#f5f5f5", fg="#666",
         ).pack(pady=(0, 6))
 
         file_frame = tk.LabelFrame(
-            self.root, text=" 转换队列 ", font=("Microsoft YaHei", 10),
-            bg="#f5f5f5", fg="#333", padx=10, pady=8,
+            self.root, text=" 转换队列 ", font=(self.ui_font_family, 10),
+            bg="#f5f5f5", fg="#333", padx=10, pady=6,
         )
         file_frame.pack(padx=24, fill="both")
 
@@ -925,34 +988,34 @@ class ConverterApp:
         button_row.pack(fill="x", pady=(0, 7))
 
         self.select_pdf_btn = tk.Button(
-            button_row, text="添加 PDF", font=("Microsoft YaHei", 10),
+            button_row, text="添加 PDF", font=(self.ui_font_family, 10),
             width=12, command=lambda: self.select_files("pdf"),
             bg="#c0392b", fg="white", activebackground="#a93226", cursor="hand2",
         )
         self.select_pdf_btn.pack(side="left", padx=(0, 7))
 
         self.select_docx_btn = tk.Button(
-            button_row, text="添加 Word", font=("Microsoft YaHei", 10),
+            button_row, text="添加 Word", font=(self.ui_font_family, 10),
             width=12, command=lambda: self.select_files("word"),
             bg="#2471a3", fg="white", activebackground="#1f618d", cursor="hand2",
         )
         self.select_docx_btn.pack(side="left", padx=(0, 7))
 
         self.select_ppt_btn = tk.Button(
-            button_row, text="添加 PowerPoint", font=("Microsoft YaHei", 10),
+            button_row, text="添加 PowerPoint", font=(self.ui_font_family, 10),
             width=15, command=lambda: self.select_files("powerpoint"),
             bg="#d35400", fg="white", activebackground="#ba4a00", cursor="hand2",
         )
         self.select_ppt_btn.pack(side="left", padx=(0, 7))
 
         self.remove_btn = tk.Button(
-            button_row, text="移除选中", font=("Microsoft YaHei", 9),
+            button_row, text="移除选中", font=(self.ui_font_family, 9),
             width=11, command=self.remove_selected,
         )
         self.remove_btn.pack(side="left", padx=(8, 5))
 
         self.clear_btn = tk.Button(
-            button_row, text="清空", font=("Microsoft YaHei", 9),
+            button_row, text="清空", font=(self.ui_font_family, 9),
             width=8, command=self.clear_queue,
         )
         self.clear_btn.pack(side="left")
@@ -960,39 +1023,32 @@ class ConverterApp:
         self.queue_summary_var = tk.StringVar(value="尚未添加文件")
         tk.Label(
             button_row, textvariable=self.queue_summary_var,
-            font=("Microsoft YaHei", 9), bg="#f5f5f5", fg="#555",
+            font=(self.ui_font_family, 9), bg="#f5f5f5", fg="#555",
         ).pack(side="right")
 
         target_row = tk.Frame(file_frame, bg="#f5f5f5")
         target_row.pack(fill="x", pady=(0, 7))
         tk.Label(
-            target_row, text="转换目标：", font=("Microsoft YaHei", 9),
+            target_row, text="PDF 转换目标：", font=(self.ui_font_family, 9),
             bg="#f5f5f5", fg="#333",
         ).pack(side="left")
         self.target_display_var = tk.StringVar(value=self.TARGET_DISPLAY[PDF_TARGET_WORD])
-        self.target_combo = ttk.Combobox(
-            target_row, textvariable=self.target_display_var,
-            values=(
-                self.TARGET_DISPLAY[PDF_TARGET_WORD],
-                self.TARGET_DISPLAY[PDF_TARGET_POWERPOINT],
-            ),
-            state="readonly", width=20,
-        )
-        self.target_combo.pack(side="left")
-        self.target_combo.bind("<<ComboboxSelected>>", self._on_target_selected)
+        self.target_zones_frame = tk.Frame(target_row, bg="#f5f5f5")
+        self.target_zones_frame.pack(side="left", fill="x", expand=True, padx=(6, 0))
         self._target_zones = {}
-        self.target_zones_frame = tk.Frame(file_frame, bg="#f5f5f5")
-        self.target_zones_frame.pack(fill="x", pady=(0, 7))
-        self._create_pdf_target_zone(PDF_TARGET_WORD, "拖入 PDF 转 Word")
-        self._create_pdf_target_zone(PDF_TARGET_POWERPOINT, "拖入 PDF 转 PowerPoint")
+        self._create_pdf_target_zone(
+            PDF_TARGET_WORD, "PDF → Word (.docx)\n拖放 PDF 到这里",
+        )
+        self._create_pdf_target_zone(
+            PDF_TARGET_POWERPOINT, "PDF → PowerPoint (.pptx)\n拖放 PDF 到这里",
+        )
         self._refresh_target_zones()
 
-        tree_frame = tk.Frame(file_frame, bg="#f5f5f5")
-        self.tree_frame = tree_frame
-        tree_frame.pack(fill="both", expand=True)
+        self.tree_frame = tk.Frame(file_frame, bg="#f5f5f5", highlightthickness=1)
+        self.tree_frame.pack(fill="both", expand=True)
         columns = ("name", "folder", "status", "output")
         self.file_tree = ttk.Treeview(
-            tree_frame, columns=columns, show="headings", height=6,
+            self.tree_frame, columns=columns, show="headings", height=4,
             selectmode="extended",
         )
         self.file_tree.heading("name", text="文件名")
@@ -1006,74 +1062,79 @@ class ConverterApp:
         self.file_tree.tag_configure("success", foreground="#18794e")
         self.file_tree.tag_configure("failed", foreground="#b42318")
         self.file_tree.tag_configure("cancelled", foreground="#777")
-        tree_scroll = ttk.Scrollbar(tree_frame, command=self.file_tree.yview)
+        tree_scroll = ttk.Scrollbar(self.tree_frame, command=self.file_tree.yview)
         self.file_tree.configure(yscrollcommand=tree_scroll.set)
         tree_scroll.pack(side="right", fill="y")
         self.file_tree.pack(side="left", fill="both", expand=True)
         self.file_tree.bind("<<TreeviewSelect>>", lambda _event: self._update_action_states())
         self.empty_drop_hint = tk.Label(
-            file_frame, text="可将 PDF、Word 或 PowerPoint 文件拖到此处",
-            font=("Microsoft YaHei", 9), bg="#f5f5f5", fg="#666", pady=5,
+            self.tree_frame,
+            text="拖放 PDF、Word 或 PowerPoint 文件到这里\nPDF 使用上方目标；Word/PPT 自动转换为 PDF",
+            font=(self.ui_font_family, 10), bg="white", fg="#666",
+            justify="center", padx=18, pady=10,
         )
-        self.empty_drop_hint.pack(fill="x")
+        self.empty_drop_hint.place(relx=0.5, rely=0.56, anchor="center")
+        self._setup_drag_and_drop()
 
         output_frame = tk.LabelFrame(
-            self.root, text=" 输出位置 ", font=("Microsoft YaHei", 10),
+            self.root, text=" 输出位置 ", font=(self.ui_font_family, 10),
             bg="#f5f5f5", fg="#333", padx=10, pady=8,
         )
-        output_frame.pack(padx=24, pady=(10, 0), fill="x")
+        output_frame.pack(padx=24, pady=(6, 0), fill="x")
 
         self.output_mode_var = tk.StringVar(value="source")
         self.source_output_radio = tk.Radiobutton(
             output_frame, text="各源文件所在目录", variable=self.output_mode_var,
             value="source", command=self._toggle_output_mode,
-            font=("Microsoft YaHei", 9), bg="#f5f5f5",
+            font=(self.ui_font_family, 9), bg="#f5f5f5",
         )
         self.source_output_radio.pack(side="left", padx=(0, 12))
         self.custom_output_radio = tk.Radiobutton(
             output_frame, text="统一输出目录", variable=self.output_mode_var,
             value="custom", command=self._toggle_output_mode,
-            font=("Microsoft YaHei", 9), bg="#f5f5f5",
+            font=(self.ui_font_family, 9), bg="#f5f5f5",
         )
         self.custom_output_radio.pack(side="left")
 
         self.output_dir_var = tk.StringVar()
         self.output_entry = tk.Entry(
             output_frame, textvariable=self.output_dir_var,
-            font=("Consolas", 9), state="readonly", readonlybackground="white",
+            font=(self.mono_font_family, 9), state="readonly", readonlybackground="white",
         )
         self.output_entry.pack(side="left", padx=8, fill="x", expand=True)
         self.browse_output_btn = tk.Button(
-            output_frame, text="选择...", font=("Microsoft YaHei", 9),
+            output_frame, text="选择...", font=(self.ui_font_family, 9),
             width=9, command=self.choose_output_dir,
         )
         self.browse_output_btn.pack(side="right")
 
         self.method_frame = tk.LabelFrame(
-            self.root, text=" 转换方式 ", font=("Microsoft YaHei", 10),
-            bg="#f5f5f5", fg="#333", padx=10, pady=7,
+            self.root, text=" 转换方式 ", font=(self.ui_font_family, 10),
+            bg="#f5f5f5", fg="#333", padx=10, pady=5,
         )
-        self.method_frame.pack(padx=24, pady=(10, 0), fill="x")
+        self.method_frame.pack(padx=24, pady=(6, 0), fill="x")
 
-        self.method_var = tk.StringVar(value="word_com")
+        self.method_var = tk.StringVar(value="images" if self.is_macos else WORD_NATIVE)
         self._method_labels = {}
         self.word_method_container = tk.Frame(self.method_frame, bg="#f5f5f5")
-        methods_desc = [
-            ("word_com", "Microsoft Word 原生转换（推荐，可编辑）"),
+        methods_desc = []
+        if not self.is_macos:
+            methods_desc.append((WORD_NATIVE, "Microsoft Word 原生转换（推荐，可编辑）"))
+        methods_desc.extend([
             ("images", "页面转高清图片嵌入（观感接近，不可编辑）"),
             ("libreoffice", "LibreOffice 引擎（兼容性有限）"),
-        ]
+        ])
         for value, description in methods_desc:
             row = tk.Frame(self.word_method_container, bg="#f5f5f5")
             row.pack(anchor="w", pady=1, fill="x")
             radio = tk.Radiobutton(
                 row, text=description, variable=self.method_var, value=value,
-                font=("Microsoft YaHei", 9), bg="#f5f5f5", anchor="w",
+                font=(self.ui_font_family, 9), bg="#f5f5f5", anchor="w",
                 command=lambda selected=value: self._on_method_selected(selected),
             )
             radio.pack(side="left")
             status_label = tk.Label(
-                row, text="检测中...", font=("Microsoft YaHei", 8),
+                row, text="检测中...", font=(self.ui_font_family, 8),
                 bg="#f5f5f5", fg="#777", width=10, anchor="e",
             )
             status_label.pack(side="right")
@@ -1084,10 +1145,10 @@ class ConverterApp:
         tk.Label(
             self.ppt_method_container,
             text="内置自适应高清图片模式（推荐，整页图片不可编辑）",
-            font=("Microsoft YaHei", 9), bg="#f5f5f5", anchor="w",
+            font=(self.ui_font_family, 9), bg="#f5f5f5", anchor="w",
         ).pack(side="left")
         self.pptx_status_label = tk.Label(
-            self.ppt_method_container, text="检测中...", font=("Microsoft YaHei", 8),
+            self.ppt_method_container, text="检测中...", font=(self.ui_font_family, 8),
             bg="#f5f5f5", fg="#777", width=10, anchor="e",
         )
         self.pptx_status_label.pack(side="right")
@@ -1096,32 +1157,32 @@ class ConverterApp:
         self.auto_method_var = tk.StringVar(value="自动选择可用引擎")
         tk.Label(
             self.auto_method_container, textvariable=self.auto_method_var,
-            font=("Microsoft YaHei", 9), bg="#f5f5f5", anchor="w",
+            font=(self.ui_font_family, 9), bg="#f5f5f5", anchor="w",
         ).pack(anchor="w")
 
         self.engine_status_var = tk.StringVar(value="环境检测中...")
         tk.Label(
             self.method_frame, textvariable=self.engine_status_var,
-            font=("Microsoft YaHei", 8), bg="#f5f5f5", fg="#666", anchor="w",
+            font=(self.ui_font_family, 8), bg="#f5f5f5", fg="#666", anchor="w",
         ).pack(side="bottom", fill="x", pady=(5, 0))
         self._update_method_panel()
 
         action_frame = tk.Frame(self.root, bg="#f5f5f5")
-        action_frame.pack(pady=(10, 7))
+        action_frame.pack(pady=(6, 4))
         self.convert_btn = tk.Button(
-            action_frame, text="开始批量转换", font=("Microsoft YaHei", 10, "bold"),
+            action_frame, text="开始批量转换", font=(self.ui_font_family, 10, "bold"),
             width=15, command=self.start_conversion,
             bg="#1e8449", fg="white", activebackground="#196f3d", cursor="hand2",
         )
         self.convert_btn.pack(side="left", padx=5)
         self.cancel_btn = tk.Button(
-            action_frame, text="取消", font=("Microsoft YaHei", 10),
+            action_frame, text="取消", font=(self.ui_font_family, 10),
             width=10, command=self.cancel_conversion,
             bg="#a04000", fg="white", activebackground="#873600", cursor="hand2",
         )
         self.cancel_btn.pack(side="left", padx=5)
         self.open_btn = tk.Button(
-            action_frame, text="打开输出目录", font=("Microsoft YaHei", 10),
+            action_frame, text="打开输出目录", font=(self.ui_font_family, 10),
             width=14, command=self.open_output_folder,
             bg="#555", fg="white", activebackground="#333", cursor="hand2",
         )
@@ -1134,16 +1195,16 @@ class ConverterApp:
         self.progress_text_var = tk.StringVar(value="就绪")
         tk.Label(
             progress_frame, textvariable=self.progress_text_var,
-            font=("Microsoft YaHei", 8), bg="#f5f5f5", fg="#666", anchor="w",
+            font=(self.ui_font_family, 8), bg="#f5f5f5", fg="#666", anchor="w",
         ).pack(fill="x", pady=(2, 0))
 
         log_frame = tk.LabelFrame(
-            self.root, text=" 转换日志 ", font=("Microsoft YaHei", 10),
+            self.root, text=" 转换日志 ", font=(self.ui_font_family, 10),
             bg="#f5f5f5", fg="#333", padx=7, pady=4,
         )
-        log_frame.pack(padx=24, pady=(6, 12), fill="both", expand=True)
+        log_frame.pack(padx=24, pady=(4, 8), fill="both", expand=True)
         self.log_text = tk.Text(
-            log_frame, height=7, font=("Consolas", 9),
+            log_frame, height=7, font=(self.mono_font_family, 9),
             bg="#1e1e1e", fg="#d4d4d4", wrap="word", state="disabled",
         )
         log_scroll = ttk.Scrollbar(log_frame, command=self.log_text.yview)
@@ -1152,118 +1213,63 @@ class ConverterApp:
         self.log_text.pack(side="left", fill="both", expand=True)
         self._update_action_states()
 
-    def _detect_engines(self, force=False):
-        if force:
-            reset_engine_cache()
-        self._engine_detection_complete = False
-        for label in self._method_labels.values():
-            label.config(text="检测中...", fg="#777")
-        self.pptx_status_label.config(text="检测中...", fg="#777")
-        self.engine_status_var.set("环境检测中...")
-        self._update_action_states()
-
-        def detect():
-            have_word = word_com_available()
-            have_powerpoint = powerpoint_com_available()
-            have_libreoffice = libreoffice_available()
-            have_pymupdf = pymupdf_available()
-            have_pptx = pptx_component_available()
-            winget_path = find_winget()
-            self.root.after(
-                0, self._update_engine_status,
-                have_word, have_powerpoint, have_libreoffice,
-                have_pymupdf, have_pptx, winget_path,
-            )
-
-        threading.Thread(target=detect, daemon=True).start()
-
-    def _update_engine_status(
-        self, have_word, have_powerpoint, have_libreoffice,
-        have_pymupdf, have_pptx, winget_path,
-    ):
-        self._winget_path = winget_path
-        self._avail_methods = {
-            "word_com": have_word,
-            "powerpoint_com": have_powerpoint,
-            "images": have_pymupdf,
-            "pptx": have_pptx,
-            "libreoffice": have_libreoffice,
-        }
-        for value, label in self._method_labels.items():
-            available = self._avail_methods[value]
-            label.config(
-                text="✓ 可用" if available else "✗ 不可用",
-                fg="#18794e" if available else "#b42318",
-            )
-        ppt_images_available = have_pymupdf and have_pptx
-        self.pptx_status_label.config(
-            text="✓ 可用" if ppt_images_available else "✗ 不可用",
-            fg="#18794e" if ppt_images_available else "#b42318",
-        )
-
-        if have_word:
-            self.method_var.set("word_com")
-        elif have_pymupdf:
-            self.method_var.set("images")
-        elif have_libreoffice:
-            self.method_var.set("libreoffice")
-
-        self._is_installing = False
-        self._engine_detection_complete = True
-        self.engine_status_var.set(
-            " | ".join((
-                f"Word: {'可用' if have_word else '不可用'}",
-                f"PowerPoint: {'可用' if have_powerpoint else '不可用'}",
-                f"LibreOffice: {'可用' if have_libreoffice else '不可用'}",
-                f"PyMuPDF: {'可用' if have_pymupdf else '不可用'}",
-                f"PPTX组件: {'可用' if have_pptx else '不可用'}",
-            ))
-        )
-        self._update_method_panel()
-        self._update_action_states()
-        self.log(f"Microsoft Word: {'可用' if have_word else '不可用'}")
-        self.log(f"Microsoft PowerPoint: {'可用' if have_powerpoint else '不可用'}")
-        self.log(f"PyMuPDF 图片模式: {'可用' if have_pymupdf else '不可用'}")
-        self.log(f"内置 PPTX 组件: {'可用' if have_pptx else '不可用'}")
-        self.log(f"LibreOffice: {'可用' if have_libreoffice else '不可用'}")
-        self.log(f"winget: {'可用' if winget_path else '不可用'}")
-
     def _create_pdf_target_zone(self, target_kind, text):
         zone = tk.Label(
-            self.target_zones_frame, text=text, font=("Microsoft YaHei", 9, "bold"),
-            bg="white", fg="#333", borderwidth=1, relief="solid", padx=10, pady=6,
+            self.target_zones_frame,
+            text=text,
+            font=(self.ui_font_family, 9, "bold"),
+            bg="white",
+            fg="#333",
+            borderwidth=1,
+            relief="solid",
+            padx=10,
+            pady=6,
             cursor="hand2",
         )
         zone.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        zone.bind("<Button-1>", lambda _event, kind=target_kind: self._select_pdf_target(kind))
+        zone.bind(
+            "<Button-1>",
+            lambda _event, kind=target_kind: self._select_pdf_target(kind),
+        )
         self._target_zones[target_kind] = zone
 
     def _refresh_target_zones(self):
         if not hasattr(self, "_target_zones"):
             return
         selected = self._current_target_kind()
-        editable = not self._is_converting and not self._is_installing and self.source_kind in (None, "pdf")
+        editable = (
+            not self._is_converting
+            and not self._is_installing
+            and self.source_kind in (None, "pdf")
+        )
         for target_kind, zone in self._target_zones.items():
-            selected_zone = target_kind == selected
+            is_selected = target_kind == selected
             zone.config(
-                bg="#e8f5e9" if selected_zone else ("white" if editable else "#ededed"),
-                fg="#145a32" if selected_zone else ("#333" if editable else "#888"),
-                relief="sunken" if selected_zone else "solid",
+                bg="#e8f5e9" if is_selected else ("white" if editable else "#ededed"),
+                fg="#145a32" if is_selected else ("#333" if editable else "#888"),
+                relief="sunken" if is_selected else "solid",
                 cursor="hand2" if editable else "arrow",
             )
 
     def _confirm_pdf_target_change(self, target_kind):
         current_target = self._current_target_kind()
-        if self.source_kind != "pdf" or not self.input_paths or current_target == target_kind:
+        if (
+            self.source_kind != "pdf"
+            or not self.input_paths
+            or current_target == target_kind
+        ):
             return True
         return messagebox.askyesno(
             "切换整批转换目标",
-            f"当前队列中的 {len(self.input_paths)} 个 PDF 将全部转换为 "
-            f"{self.TARGET_DISPLAY[target_kind]}。是否继续？",
+            f"当前队列中的 {len(self.input_paths)} 个 PDF 将全部从 "
+            f"{self.TARGET_DISPLAY[current_target]} 改为 "
+            f"{self.TARGET_DISPLAY[target_kind]}。\n\n是否继续？",
         )
 
     def _select_pdf_target(self, target_kind):
-        if self._is_converting or self._is_installing or self.source_kind not in (None, "pdf"):
+        if self._is_converting or self._is_installing:
+            return
+        if self.source_kind not in (None, "pdf"):
             return
         if not self._confirm_pdf_target_change(target_kind):
             return
@@ -1272,197 +1278,448 @@ class ConverterApp:
         self._refresh_queue()
 
     def _setup_drag_and_drop(self):
-        if DND_FILES is None:
-            if hasattr(self, "empty_drop_hint"):
-                self.empty_drop_hint.config(text="拖放组件不可用，请使用上方按钮添加文件", fg="#666")
+        dnd_ready = (
+            DND_FILES is not None
+            and getattr(self.root, "_pdf_converter_dnd_available", True)
+        )
+        if not dnd_ready:
+            self.empty_drop_hint.config(
+                text="拖放组件不可用，请使用上方按钮添加文件",
+                fg="#666",
+            )
             return
+
         try:
             for widget in (self.file_tree, self.empty_drop_hint):
                 widget.drop_target_register(DND_FILES)
-                widget.dnd_bind("<<DropEnter>>", lambda event: self._on_drop_hover(event, None, True))
-                widget.dnd_bind("<<DropLeave>>", lambda event: self._on_drop_hover(event, None, False))
-                widget.dnd_bind("<<Drop>>", lambda event: self._on_files_dropped(event, None))
+                widget.dnd_bind(
+                    "<<DropEnter>>",
+                    lambda event: self._on_drop_hover(event, None, True),
+                )
+                widget.dnd_bind(
+                    "<<DropLeave>>",
+                    lambda event: self._on_drop_hover(event, None, False),
+                )
+                widget.dnd_bind(
+                    "<<Drop>>",
+                    lambda event: self._on_files_dropped(event, None),
+                )
+
             for target_kind, widget in self._target_zones.items():
                 widget.drop_target_register(DND_FILES)
-                widget.dnd_bind("<<DropEnter>>", lambda event, kind=target_kind: self._on_drop_hover(event, kind, True))
-                widget.dnd_bind("<<DropLeave>>", lambda event, kind=target_kind: self._on_drop_hover(event, kind, False))
-                widget.dnd_bind("<<Drop>>", lambda event, kind=target_kind: self._on_files_dropped(event, kind))
+                widget.dnd_bind(
+                    "<<DropEnter>>",
+                    lambda event, kind=target_kind: self._on_drop_hover(
+                        event, kind, True,
+                    ),
+                )
+                widget.dnd_bind(
+                    "<<DropLeave>>",
+                    lambda event, kind=target_kind: self._on_drop_hover(
+                        event, kind, False,
+                    ),
+                )
+                widget.dnd_bind(
+                    "<<Drop>>",
+                    lambda event, kind=target_kind: self._on_files_dropped(
+                        event, kind,
+                    ),
+                )
         except (AttributeError, tk.TclError):
-            logging.exception("TkDND initialization failed")
-            self.empty_drop_hint.config(text="拖放组件不可用，请使用上方按钮添加文件", fg="#666")
+            logging.exception("TkDND could not be initialized; falling back to file buttons")
+            self.root._pdf_converter_dnd_available = False
+            self.empty_drop_hint.config(
+                text="拖放组件不可用，请使用上方按钮添加文件",
+                fg="#666",
+            )
 
-    def _on_drop_hover(self, _event, target_kind, active):
-        if target_kind is None and hasattr(self, "tree_frame"):
+    def _on_drop_hover(self, event, target_kind, active):
+        if target_kind is None:
             color = "#1e8449" if active else "#d0d0d0"
             self.tree_frame.config(highlightbackground=color, highlightcolor=color)
-        elif target_kind is not None and hasattr(self, "_target_zones"):
-            if active:
-                self._target_zones[target_kind].config(bg="#fff2cc")
-            else:
-                self._refresh_target_zones()
-        return REFUSE_DROP if self._is_converting or self._is_installing else COPY
+        elif active:
+            self._target_zones[target_kind].config(bg="#fff2cc")
+        else:
+            self._refresh_target_zones()
+        if self._is_converting or self._is_installing:
+            return REFUSE_DROP
+        return COPY
 
     def _on_files_dropped(self, event, forced_pdf_target=None):
         self._on_drop_hover(event, forced_pdf_target, False)
         if self._is_converting or self._is_installing:
             return REFUSE_DROP
+
         try:
             dropped = self.root.tk.splitlist(event.data)
         except tk.TclError as exc:
             self.log(f"无法解析拖入的文件: {exc}")
             messagebox.showerror("拖放失败", "无法读取拖入的文件路径。")
             return REFUSE_DROP
+
         try:
             source_kind, accepted, ignored = classify_dropped_paths(dropped)
         except MixedSourceKindsError as exc:
             self.log(str(exc))
-            messagebox.showwarning("请分批拖入", f"{exc}\n\n每个批次只能处理一种源格式。")
+            messagebox.showwarning(
+                "请分批拖入",
+                f"{exc}\n\n每个批次只能处理一种源格式，请分开拖入。",
+            )
             return REFUSE_DROP
+
         if not accepted:
-            messagebox.showwarning("没有可添加的文件", "仅支持 PDF、DOCX、PPT 和 PPTX 文件。")
+            messagebox.showwarning(
+                "没有可添加的文件",
+                "仅支持 PDF、DOCX、PPT 和 PPTX 文件；文件夹不会递归导入。",
+            )
             return REFUSE_DROP
+
         if forced_pdf_target is not None and source_kind != "pdf":
-            messagebox.showinfo("此区域仅接收 PDF", "请将 Word 或 PowerPoint 文件拖到转换队列。")
+            messagebox.showinfo(
+                "此区域仅接收 PDF",
+                "请将 Word 或 PowerPoint 文件拖到下方转换队列。",
+            )
             return REFUSE_DROP
+
         if source_kind == "pdf":
             target_kind = forced_pdf_target or self._current_target_kind()
             if target_kind == "pdf":
                 target_kind = PDF_TARGET_WORD
         else:
             target_kind = "pdf"
+
         added = self._add_paths(source_kind, accepted, target_kind)
         if not added:
             return REFUSE_DROP
-        if ignored:
-            messagebox.showwarning("已忽略部分内容", f"已添加 {added} 个文件，忽略 {len(ignored)} 个不支持的项目。")
+        if added and ignored:
+            messagebox.showwarning(
+                "已忽略部分内容",
+                f"已添加 {added} 个文件，另有 {len(ignored)} 个不支持的文件或文件夹被忽略。",
+            )
         return COPY
 
     def _detect_engines(self, force=False):
         if force:
             reset_engine_cache()
-        self._engine_generation = getattr(self, "_engine_generation", 0) + 1
+
+        if self.is_macos:
+            self._word_registered = self.platform_services.native_app_installed("word")
+            self._powerpoint_registered = self.platform_services.native_app_installed(
+                "powerpoint"
+            )
+            word_probe = self._mac_word_backend.probe
+            powerpoint_probe = self._mac_powerpoint_backend.probe
+        else:
+            self._word_registered = _com_application_registered("Word.Application")
+            self._powerpoint_registered = _com_application_registered(
+                "PowerPoint.Application"
+            )
+            word_probe = word_com_available
+            powerpoint_probe = powerpoint_com_available
+        self._libreoffice_detected = bool(_find_libreoffice())
+        self._engine_generation += 1
         generation = self._engine_generation
         if force and self._is_installing:
             self._install_detection_generation = generation
         self._engine_detection_complete = False
         self._engine_started_at = time.perf_counter()
-        self._word_registered = _com_application_registered("Word.Application")
-        self._powerpoint_registered = _com_application_registered("PowerPoint.Application")
         probes = {
-            "word_com": word_com_available,
-            "powerpoint_com": powerpoint_com_available,
+            WORD_NATIVE: word_probe,
+            POWERPOINT_NATIVE: powerpoint_probe,
             "libreoffice": libreoffice_available,
             "images": pymupdf_available,
             "pptx": pptx_component_available,
-            "winget": find_winget,
         }
+        if not self.is_macos:
+            probes["winget"] = find_winget
         self._pending_engine_checks = set(probes)
         self._engine_elapsed_ms = {}
-        self._avail_methods = {key: None for key in probes if key != "winget"}
+        for key in self._avail_methods:
+            self._avail_methods[key] = None
+        for key in (WORD_NATIVE, POWERPOINT_NATIVE, "libreoffice", "images", "pptx"):
+            self._engine_statuses[key] = EngineStatus(EngineState.CHECKING)
         self._winget_path = None
         self._update_engine_indicators()
         self._refresh_engine_status_text()
         self._update_action_states()
+
         for key, probe in probes.items():
-            threading.Thread(target=self._run_engine_probe, args=(generation, key, probe), daemon=True).start()
-            self.root.after(20000, self._expire_engine_probe, generation, key)
+            threading.Thread(
+                target=self._run_engine_probe,
+                args=(generation, key, probe),
+                daemon=True,
+            ).start()
+            self.root.after(
+                20000,
+                self._expire_engine_probe,
+                generation,
+                key,
+            )
 
     def _expire_engine_probe(self, generation, key):
-        if generation != self._engine_generation or key not in self._pending_engine_checks:
+        if generation != self._engine_generation:
             return
-        self._apply_engine_probe_result(generation, key, False, 20000)
+        if key not in self._pending_engine_checks:
+            return
+        self._apply_engine_probe_result(
+            generation,
+            key,
+            EngineStatus(
+                EngineState.TIMEOUT,
+                "检测超时，后台检查已停止等待",
+            ) if key != "winget" else False,
+            20000,
+        )
 
     def _run_engine_probe(self, generation, key, probe):
         started_at = time.perf_counter()
+        error = None
         try:
             result = probe()
         except Exception as exc:
             logging.exception("Environment probe failed: %s", key)
             result = False
-            self.log(f"{key} 检测失败: {exc}")
+            error = str(exc)
         elapsed_ms = round((time.perf_counter() - started_at) * 1000)
-        self.root.after(0, self._apply_engine_probe_result, generation, key, result, elapsed_ms)
+        self.root.after(
+            0,
+            self._apply_engine_probe_result,
+            generation,
+            key,
+            result,
+            elapsed_ms,
+            error,
+        )
 
-    def _availability_text(self, key, available):
-        if available is None:
-            return "检测中"
-        if available:
-            return "可用"
-        registered = {"word_com": getattr(self, "_word_registered", False), "powerpoint_com": getattr(self, "_powerpoint_registered", False)}.get(key, False)
-        return "已安装/启动失败" if registered else "不可用"
-
-    def _apply_engine_probe_result(self, generation, key, result, elapsed_ms):
-        if generation != self._engine_generation or key not in self._pending_engine_checks:
+    def _apply_engine_probe_result(
+        self, generation, key, result, elapsed_ms, error=None,
+    ):
+        if generation != self._engine_generation:
             return
+        if key not in self._pending_engine_checks:
+            return
+
         self._pending_engine_checks.discard(key)
         self._engine_elapsed_ms[key] = elapsed_ms
         if key == "winget":
             self._winget_path = result or None
+            available = bool(self._winget_path)
         else:
-            self._avail_methods[key] = bool(result)
-        available = bool(self._winget_path) if key == "winget" else self._avail_methods[key]
-        names = {"word_com": "Microsoft Word", "powerpoint_com": "Microsoft PowerPoint", "libreoffice": "LibreOffice", "images": "PyMuPDF 图片模式", "pptx": "内置 PPTX 组件", "winget": "winget"}
-        self.log(f"{names[key]}: {self._availability_text(key, available)}（检测 {elapsed_ms} ms）")
-        if not self._is_installing and self._avail_methods.get(self.method_var.get()) is False:
+            status = _coerce_engine_status(result, error)
+            self._set_engine_status(key, status)
+            available = self._method_availability(key)
+
+        display_names = {
+            WORD_NATIVE: "Microsoft Word",
+            POWERPOINT_NATIVE: "Microsoft PowerPoint",
+            "word_com": "Microsoft Word",
+            "powerpoint_com": "Microsoft PowerPoint",
+            "libreoffice": "LibreOffice",
+            "images": "PyMuPDF 图片模式",
+            "pptx": "内置 PPTX 组件",
+            "winget": "winget",
+        }
+        status_detail = ""
+        if key != "winget":
+            status_detail = self._engine_statuses[_canonical_engine_key(key)].detail
+        detail_text = status_detail or (str(error) if error else "")
+        detail = f"；{detail_text}" if detail_text else ""
+        self.log(
+            f"{display_names[key]}: {self._availability_text(key, available)}"
+            f"（检测 {elapsed_ms} ms）{detail}"
+        )
+
+        current_method = self.method_var.get()
+        if (
+            not self._is_installing
+            and self._method_availability(current_method) is False
+        ):
             self._select_best_pdf_method()
+
         if not self._pending_engine_checks:
             self._engine_detection_complete = True
-            if getattr(self, "_install_detection_generation", None) == generation:
+            if self._install_detection_generation == generation:
                 self._is_installing = False
                 self._install_detection_generation = None
             total_ms = round((time.perf_counter() - self._engine_started_at) * 1000)
             self.log(f"环境检测完成，共 {total_ms} ms")
+
         self._update_engine_indicators()
         self._refresh_engine_status_text()
         self._update_method_panel()
         self._update_action_states()
 
+    def _availability_text(self, key, available):
+        canonical = _canonical_engine_key(key)
+        status = getattr(self, "_engine_statuses", {}).get(canonical)
+        if status is not None:
+            labels = {
+                EngineState.CHECKING: "检测中",
+                EngineState.AVAILABLE: "可用",
+                EngineState.MISSING: "不可用",
+                EngineState.UNVERIFIED: "已安装/使用时验证",
+                EngineState.PERMISSION_DENIED: "需要自动化权限",
+                EngineState.LAUNCH_FAILED: "已安装/启动失败",
+                EngineState.TIMEOUT: "检测超时",
+                EngineState.UNSUPPORTED: "此平台不支持",
+            }
+            return labels[status.state]
+        if available is None:
+            return "检测中"
+        if available:
+            return "可用"
+        detected = {
+            WORD_NATIVE: getattr(self, "_word_registered", False),
+            POWERPOINT_NATIVE: getattr(self, "_powerpoint_registered", False),
+            "word_com": getattr(self, "_word_registered", False),
+            "powerpoint_com": getattr(self, "_powerpoint_registered", False),
+            "libreoffice": getattr(self, "_libreoffice_detected", False),
+        }.get(key, False)
+        return "已安装/启动失败" if detected else "不可用"
+
+    def _set_engine_status(self, key, status):
+        canonical = _canonical_engine_key(key)
+        if not hasattr(self, "_engine_statuses"):
+            self._engine_statuses = {}
+        self._engine_statuses[canonical] = status
+        availability = None if status.state is EngineState.CHECKING else _status_selectable(status)
+        self._avail_methods[canonical] = availability
+        if canonical == WORD_NATIVE:
+            self._avail_methods["word_com"] = availability
+        elif canonical == POWERPOINT_NATIVE:
+            self._avail_methods["powerpoint_com"] = availability
+
+    def _method_availability(self, key):
+        canonical = _canonical_engine_key(key)
+        if canonical in self._avail_methods:
+            return self._avail_methods.get(canonical)
+        if key in self._avail_methods:
+            return self._avail_methods.get(key)
+        legacy = {
+            WORD_NATIVE: "word_com",
+            POWERPOINT_NATIVE: "powerpoint_com",
+        }.get(canonical)
+        return self._avail_methods.get(legacy) if legacy else None
+
     def _update_engine_indicators(self):
         for value, label in self._method_labels.items():
-            available = self._avail_methods.get(value)
-            label.config(text="检测中..." if available is None else ("✓ 可用" if available else "✗ 不可用"), fg="#777" if available is None else ("#18794e" if available else "#b42318"))
-        images = self._avail_methods.get("images")
-        pptx = self._avail_methods.get("pptx")
-        if images is None or pptx is None:
+            available = self._method_availability(value)
+            status_text = self._availability_text(value, available)
+            if available is None:
+                label.config(text="检测中...", fg="#777")
+            elif status_text == "已安装/使用时验证":
+                label.config(text="使用时验证", fg="#a04000")
+            elif status_text == "需要自动化权限":
+                label.config(text="需要权限", fg="#b42318")
+            elif available:
+                label.config(text="✓ 可用", fg="#18794e")
+            elif status_text == "已安装/启动失败":
+                label.config(text="启动失败", fg="#a04000")
+            elif status_text == "检测超时":
+                label.config(text="检测超时", fg="#a04000")
+            else:
+                label.config(text="✗ 不可用", fg="#b42318")
+
+        image_state = self._avail_methods.get("images")
+        pptx_state = self._avail_methods.get("pptx")
+        if image_state is None or pptx_state is None:
             self.pptx_status_label.config(text="检测中...", fg="#777")
         else:
-            self.pptx_status_label.config(text="✓ 可用" if images and pptx else "✗ 不可用", fg="#18794e" if images and pptx else "#b42318")
+            available = image_state and pptx_state
+            self.pptx_status_label.config(
+                text="✓ 可用" if available else "✗ 不可用",
+                fg="#18794e" if available else "#b42318",
+            )
 
     def _refresh_engine_status_text(self):
-        values = self._avail_methods
-        winget = "检测中" if "winget" in self._pending_engine_checks else ("可用" if self._winget_path else "不可用")
-        self.engine_status_var.set(" | ".join((
-            f"Word: {self._availability_text('word_com', values.get('word_com'))}",
-            f"PowerPoint: {self._availability_text('powerpoint_com', values.get('powerpoint_com'))}",
-            f"LibreOffice: {self._availability_text('libreoffice', values.get('libreoffice'))}",
-            f"winget: {winget}",
-        )))
+        native_line = " | ".join((
+            f"Word: {self._availability_text(WORD_NATIVE, self._method_availability(WORD_NATIVE))}",
+            f"PowerPoint: {self._availability_text(POWERPOINT_NATIVE, self._method_availability(POWERPOINT_NATIVE))}",
+            f"LibreOffice: {self._availability_text('libreoffice', self._method_availability('libreoffice'))}",
+        ))
+        component_parts = [
+            f"PyMuPDF: {self._availability_text('images', self._method_availability('images'))}",
+            f"PPTX组件: {self._availability_text('pptx', self._method_availability('pptx'))}",
+        ]
+        if not getattr(self, "is_macos", False):
+            winget_status = (
+                "检测中"
+                if "winget" in self._pending_engine_checks
+                else ("可用" if self._winget_path else "不可用")
+            )
+            component_parts.append(f"winget: {winget_status}")
+        self.engine_status_var.set(
+            native_line + "\n" + " | ".join(component_parts)
+        )
 
-    def _conversion_detection_ready(self):
-        spec = self._current_spec()
-        if spec is None:
-            return False
-        if spec.key == "pdf_to_word":
-            return self._avail_methods.get(self.method_var.get()) is not None
-        if spec.key == "pdf_to_powerpoint":
-            return self._avail_methods.get("images") is not None and self._avail_methods.get("pptx") is not None
-        if spec.key == "word_to_pdf":
-            word = self._avail_methods.get("word_com")
-            return word is True or (word is False and self._avail_methods.get("libreoffice") is not None)
-        powerpoint = self._avail_methods.get("powerpoint_com")
-        return powerpoint is True or (powerpoint is False and self._avail_methods.get("libreoffice") is not None)
+    def _update_engine_status(
+        self, have_word, have_powerpoint, have_libreoffice,
+        have_pymupdf, have_pptx, winget_path,
+    ):
+        """Apply a complete result set; retained for logic tests and integrations."""
+        self._avail_methods = {
+            WORD_NATIVE: _availability_from_result(have_word),
+            POWERPOINT_NATIVE: _availability_from_result(have_powerpoint),
+            "word_com": _availability_from_result(have_word),
+            "powerpoint_com": _availability_from_result(have_powerpoint),
+            "images": _availability_from_result(have_pymupdf),
+            "pptx": _availability_from_result(have_pptx),
+            "libreoffice": _availability_from_result(have_libreoffice),
+        }
+        self._engine_statuses = {
+            WORD_NATIVE: _coerce_engine_status(have_word),
+            POWERPOINT_NATIVE: _coerce_engine_status(have_powerpoint),
+            "libreoffice": _coerce_engine_status(have_libreoffice),
+            "images": _coerce_engine_status(have_pymupdf),
+            "pptx": _coerce_engine_status(have_pptx),
+        }
+        self._winget_path = winget_path
+        self._pending_engine_checks = set()
+        self._engine_detection_complete = True
+        self._select_best_pdf_method()
+        self._update_engine_indicators()
+        self._refresh_engine_status_text()
+        self._update_method_panel()
+        self._update_action_states()
 
     def _current_target_kind(self):
         return self.TARGET_KIND.get(self.target_display_var.get(), PDF_TARGET_WORD)
 
     def _set_target_kind(self, target_kind):
         self.target_display_var.set(self.TARGET_DISPLAY[target_kind])
+        if hasattr(self, "_target_zones"):
+            self._refresh_target_zones()
 
     def _current_spec(self):
         if not self.source_kind:
             return None
         pdf_target = self._current_target_kind()
         return resolve_conversion_spec(self.source_kind, pdf_target)
+
+    def _conversion_detection_ready(self):
+        spec = self._current_spec()
+        if spec is None:
+            return False
+        if spec.key == "pdf_to_word":
+            return self._method_availability(self.method_var.get()) is not None
+        if spec.key == "pdf_to_powerpoint":
+            return (
+                self._method_availability("images") is not None
+                and self._method_availability("pptx") is not None
+            )
+        if spec.key == "word_to_pdf":
+            word_state = self._method_availability(WORD_NATIVE)
+            libreoffice_state = self._method_availability("libreoffice")
+            return word_state is True or (
+                word_state is False and libreoffice_state is not None
+            )
+        if spec.key == "powerpoint_to_pdf":
+            powerpoint_state = self._method_availability(POWERPOINT_NATIVE)
+            libreoffice_state = self._method_availability("libreoffice")
+            return powerpoint_state is True or (
+                powerpoint_state is False and libreoffice_state is not None
+            )
+        return False
 
     def _update_method_panel(self):
         for container in (
@@ -1483,10 +1740,11 @@ class ConverterApp:
         elif spec.key == "pdf_to_powerpoint":
             self.ppt_method_container.pack(fill="x")
         else:
+            native_kind = "AppleScript" if getattr(self, "is_macos", False) else "本机 Office"
             if spec.key == "word_to_pdf":
-                text = "自动选择：Microsoft Word 优先，LibreOffice 备用"
+                text = f"自动选择：Microsoft Word {native_kind} 优先，LibreOffice 备用"
             else:
-                text = "自动选择：Microsoft PowerPoint 优先，LibreOffice 备用"
+                text = f"自动选择：Microsoft PowerPoint {native_kind} 优先，LibreOffice 备用"
             self.auto_method_var.set(text)
             self.auto_method_container.pack(fill="x")
 
@@ -1497,34 +1755,52 @@ class ConverterApp:
         self._refresh_queue()
 
     def _select_best_pdf_method(self):
-        for method in ("word_com", "images", "libreoffice"):
-            if self._avail_methods.get(method):
+        methods = ("images", "libreoffice") if getattr(self, "is_macos", False) else (
+            WORD_NATIVE, "images", "libreoffice"
+        )
+        for method in methods:
+            if self._method_availability(method):
                 self.method_var.set(method)
                 return
 
     def _on_method_selected(self, method):
-        if method == "word_com" and not self._avail_methods.get("word_com"):
+        if method == WORD_NATIVE and not self._method_availability(WORD_NATIVE):
             accepted = self._prompt_word_install()
             if not accepted:
                 self._select_best_pdf_method()
-        elif method == "libreoffice" and not self._avail_methods.get("libreoffice"):
+        elif method == "libreoffice" and not self._method_availability("libreoffice"):
             accepted = self._prompt_libreoffice_install()
             if not accepted:
                 self._select_best_pdf_method()
 
     def _prompt_word_install(self):
-        if self._avail_methods.get("word_com") or self._is_installing:
+        if self._method_availability(WORD_NATIVE) or self._is_installing:
             return False
         if getattr(self, "_word_registered", False):
-            self.log("Microsoft Word is installed but COM automation is unavailable")
+            self.log("检测到 Microsoft Word 已安装，但原生自动化暂不可用")
+            if getattr(self, "is_macos", False):
+                guidance = (
+                    "请前往“系统设置 → 隐私与安全性 → 自动化”，允许本工具控制 "
+                    "Microsoft Word，然后重试；无需重新安装 Office。"
+                )
+            else:
+                guidance = (
+                    "请关闭 Word 的登录、许可或文档提示窗口后重新启动本工具，"
+                    "无需重复安装 Office。"
+                )
             messagebox.showwarning(
                 "Microsoft Word 暂不可用",
-                "已检测到 Microsoft Word，但其自动化启动失败。请关闭登录、许可或提示窗口后重试，无需重复安装。",
+                "已检测到 Microsoft Word，但自动化启动失败。\n\n" + guidance,
             )
             return False
+        install_text = (
+            "是否打开 Microsoft Office 官方下载页？"
+            if getattr(self, "is_macos", False)
+            else "是否使用 winget 安装 Microsoft Office？"
+        )
         confirmed = messagebox.askyesno(
             "未检测到 Microsoft Word",
-            "是否使用 winget 安装 Microsoft Office？\n\n"
+            install_text + "\n\n"
             "Office 需要有效许可证和 Microsoft 账号，安装过程可能要求管理员权限。"
             "程序不会自动提供许可证。",
         )
@@ -1535,11 +1811,25 @@ class ConverterApp:
         return confirmed
 
     def _prompt_libreoffice_install(self):
-        if self._avail_methods.get("libreoffice") or self._is_installing:
+        if self._method_availability("libreoffice") or self._is_installing:
             return False
+        if getattr(self, "_libreoffice_detected", False):
+            self.log("检测到 LibreOffice 已安装，但无头模式启动失败")
+            messagebox.showwarning(
+                "LibreOffice 暂不可用",
+                "已检测到 LibreOffice 程序，但后台启动失败。\n\n"
+                "请关闭正在运行的 LibreOffice 窗口后重新启动本工具，"
+                "无需重复安装。",
+            )
+            return False
+        install_text = (
+            "是否打开 LibreOffice 官方下载页？"
+            if getattr(self, "is_macos", False)
+            else "是否使用 winget 安装官方 LibreOffice？"
+        )
         confirmed = messagebox.askyesno(
             "需要 LibreOffice",
-            "当前任务没有可用的 LibreOffice 引擎。是否使用 winget 安装官方 LibreOffice？",
+            "当前任务没有可用的 LibreOffice 引擎。" + install_text,
         )
         if confirmed:
             self._start_install("libreoffice")
@@ -1547,15 +1837,55 @@ class ConverterApp:
             self.log("用户已拒绝安装 LibreOffice")
         return confirmed
 
+    def _prompt_macos_conversion_engines(self, native_name, native_key, registered):
+        status = getattr(self, "_engine_statuses", {}).get(native_key)
+        if registered:
+            detail = status.detail if status and status.detail else self._availability_text(
+                native_key,
+                self._method_availability(native_key),
+            )
+            if status and status.state is EngineState.PERMISSION_DENIED:
+                guidance = "请先检查“系统设置 → 隐私与安全性 → 自动化”的授权。"
+            elif status and status.state is EngineState.TIMEOUT:
+                guidance = "请关闭 Office 中的弹窗或占用文件后重试。"
+            else:
+                guidance = "请先确认 Office 已完成登录和许可证激活。"
+            use_libreoffice = messagebox.askyesno(
+                f"{native_name} 暂不可用",
+                f"已检测到 {native_name}，但原生转换暂不可用。\n\n"
+                f"{guidance}\n{detail}\n\n"
+                "是否打开 LibreOffice 官方下载页作为备用？",
+            )
+            if use_libreoffice:
+                self._start_install("libreoffice")
+            return use_libreoffice
+
+        choice = messagebox.askyesnocancel(
+            "缺少转换引擎",
+            f"未检测到 {native_name} 或 LibreOffice。\n\n"
+            f"选择“是”打开 Microsoft Office 官方下载页；\n"
+            "选择“否”打开 LibreOffice 官方下载页；\n"
+            "选择“取消”则不执行任何操作。\n\n"
+            "程序不会自动安装软件，也不会提供 Office 许可证。",
+        )
+        if choice is None:
+            self.log("用户取消打开转换引擎下载页")
+            return False
+        product = "office" if choice else "libreoffice"
+        self._start_install(product)
+        return True
+
     def _start_install(self, product):
         display_name = "Microsoft Office" if product == "office" else "LibreOffice"
-        if not self._winget_path:
-            self.log(f"winget 不可用，正在打开 {display_name} 官方下载页")
-            messagebox.showwarning(
-                "winget 不可用",
-                f"当前系统未找到 winget，将打开 {display_name} 官方下载页。",
-            )
-            open_official_download(product)
+        action = self.platform_services.installer_action(product)
+        if action.kind is InstallerActionKind.OPEN_URL:
+            self.log(f"正在打开 {display_name} 官方下载页")
+            result = self.platform_services.perform_installer_action(action)
+            if not result.succeeded:
+                messagebox.showerror(
+                    "无法打开下载页",
+                    f"无法打开 {display_name} 官方下载页。\n\n{result.detail}",
+                )
             return
 
         self._is_installing = True
@@ -1563,10 +1893,9 @@ class ConverterApp:
         self._update_action_states()
         self.progress_text_var.set(f"正在安装 {display_name}...")
         self.log(f"开始安装 {display_name}")
-        command = build_install_command(product, self._winget_path)
 
         def install():
-            result = run_install_command(command)
+            result = self.platform_services.perform_installer_action(action)
             self.root.after(0, self._finish_install, product, display_name, result)
 
         threading.Thread(target=install, daemon=True).start()
@@ -1581,10 +1910,11 @@ class ConverterApp:
         self._is_installing = False
         self._engine_detection_complete = True
         self._update_action_states()
-        self.log(f"{display_name} 安装失败: {result.message}")
+        failure_detail = getattr(result, "message", "") or getattr(result, "detail", "")
+        self.log(f"{display_name} 安装失败: {failure_detail}")
         messagebox.showwarning(
             "安装失败",
-            f"{display_name} 安装未成功。将打开官方下载页。\n\n{result.message}",
+            f"{display_name} 安装未成功。将打开官方下载页。\n\n{failure_detail}",
         )
         open_official_download(product)
 
@@ -1632,27 +1962,41 @@ class ConverterApp:
 
         selected = filedialog.askopenfilenames(title=title, filetypes=filetypes)
         if not selected:
-            return
+            return 0
 
         selected_paths = [
             Path(path) for path in selected if Path(path).suffix.lower() in extensions
         ]
+        return self._add_paths(
+            source_kind,
+            selected_paths,
+            target_kind_after_selection,
+        )
+
+    def _add_paths(self, source_kind, selected_paths, target_kind):
+        selected_paths = list(selected_paths)
+        if not selected_paths:
+            return 0
+
         if self.source_kind and self.source_kind != source_kind:
             confirmed = messagebox.askyesno(
                 "切换转换方向",
                 "当前队列包含另一种文件。是否清空现有队列并切换转换方向？",
             )
             if not confirmed:
-                return
+                return 0
             self._clear_queue(log_change=False)
 
-        self._set_target_kind(target_kind_after_selection)
+        if source_kind == "pdf" and not self._confirm_pdf_target_change(target_kind):
+            return 0
+        self._set_target_kind(target_kind)
         previous_count = len(self.input_paths)
         self.input_paths = deduplicate_paths(self.input_paths + selected_paths)
         self.source_kind = source_kind if self.input_paths else None
         self._refresh_queue()
         added_count = len(self.input_paths) - previous_count
         self.log(f"已添加 {added_count} 个文件；队列共 {len(self.input_paths)} 个")
+        return added_count
 
     def _path_key(self, path: Path) -> str:
         return os.path.normcase(os.path.normpath(str(Path(path).absolute())))
@@ -1671,6 +2015,10 @@ class ConverterApp:
         direction = spec.label.replace(" -> ", " → ") if spec else ""
         summary = f"{direction} · {len(self.input_paths)} 个文件" if direction else "尚未添加文件"
         self.queue_summary_var.set(summary)
+        if self.input_paths:
+            self.empty_drop_hint.place_forget()
+        else:
+            self.empty_drop_hint.place(relx=0.5, rely=0.56, anchor="center")
         self._update_method_panel()
         self._update_action_states()
 
@@ -1737,19 +2085,19 @@ class ConverterApp:
         if not self.input_paths:
             messagebox.showwarning("提示", "请先添加文件")
             return
-        if not self._engine_detection_complete:
-            messagebox.showinfo("提示", "转换引擎仍在检测，请稍候")
-            return
 
         spec = self._current_spec()
         if spec is None:
             messagebox.showerror("队列错误", "无法确定当前转换方向")
             return
+        if not self._conversion_detection_ready():
+            messagebox.showinfo("提示", "当前转换方向所需引擎仍在检测，请稍候")
+            return
 
         if spec.key == "pdf_to_word":
             method = self.method_var.get()
-            if not self._avail_methods.get(method):
-                if method == "word_com":
+            if not self._method_availability(method):
+                if method == WORD_NATIVE:
                     self._prompt_word_install()
                     return
                 if method == "libreoffice":
@@ -1757,12 +2105,18 @@ class ConverterApp:
                     return
                 messagebox.showerror("转换方式不可用", "请选择一个当前可用的 PDF 转换方式")
                 return
+            if self.is_macos and method == WORD_NATIVE:
+                messagebox.showerror(
+                    "此平台不支持",
+                    "macOS 首版尚未开放 Word 原生 PDF → DOCX，请改用图片模式或 LibreOffice。",
+                )
+                return
         elif spec.key == "pdf_to_powerpoint":
             method = "ppt_images"
             missing = []
-            if not self._avail_methods.get("images"):
+            if not self._method_availability("images"):
                 missing.append("PyMuPDF")
-            if not self._avail_methods.get("pptx"):
+            if not self._method_availability("pptx"):
                 missing.append("python-pptx")
             if missing:
                 messagebox.showerror(
@@ -1773,16 +2127,30 @@ class ConverterApp:
                 return
         elif spec.key == "word_to_pdf":
             method = None
-            if not (self._avail_methods.get("word_com") or self._avail_methods.get("libreoffice")):
-                self._prompt_libreoffice_install()
+            if not (self._method_availability(WORD_NATIVE) or self._method_availability("libreoffice")):
+                if self.is_macos:
+                    self._prompt_macos_conversion_engines(
+                        "Microsoft Word",
+                        WORD_NATIVE,
+                        getattr(self, "_word_registered", False),
+                    )
+                else:
+                    self._prompt_libreoffice_install()
                 return
         elif spec.key == "powerpoint_to_pdf":
             method = None
             if not (
-                self._avail_methods.get("powerpoint_com")
-                or self._avail_methods.get("libreoffice")
+                self._method_availability(POWERPOINT_NATIVE)
+                or self._method_availability("libreoffice")
             ):
-                self._prompt_libreoffice_install()
+                if self.is_macos:
+                    self._prompt_macos_conversion_engines(
+                        "Microsoft PowerPoint",
+                        POWERPOINT_NATIVE,
+                        getattr(self, "_powerpoint_registered", False),
+                    )
+                else:
+                    self._prompt_libreoffice_install()
                 return
 
         try:
@@ -1830,10 +2198,54 @@ class ConverterApp:
         except Exception as exc:
             self.root.after(0, self._on_batch_error, str(exc))
 
+    def _record_native_status(self, key, status):
+        self._set_engine_status(key, status)
+        self.root.after(0, self._update_engine_indicators)
+        self.root.after(0, self._refresh_engine_status_text)
+        self.root.after(0, self._update_action_states)
+
+    def _convert_with_macos_backend(self, key, backend, source, output, progress):
+        try:
+            backend.convert(source, output, progress)
+        except MacOSOfficeError as exc:
+            self._record_native_status(key, exc.status)
+            raise
+        else:
+            self._record_native_status(
+                key,
+                EngineStatus(EngineState.AVAILABLE, "转换已验证"),
+            )
+
+    def _convert_with_windows_fallback(
+        self,
+        native_name,
+        native_converter,
+        libreoffice_converter,
+        source,
+        output,
+        progress,
+    ):
+        try:
+            native_converter(source, output, progress)
+        except Exception as native_error:
+            if not _engine_result_selectable(libreoffice_available()):
+                raise
+            output_path = Path(output)
+            if output_path.exists():
+                output_path.unlink()
+            progress(f"{native_name} 原生转换失败，改用 LibreOffice 重试...", 5)
+            try:
+                libreoffice_converter(source, output, progress)
+            except Exception as fallback_error:
+                raise RuntimeError(
+                    f"{native_name} 原生转换失败：{native_error}\n"
+                    f"LibreOffice 回退也失败：{fallback_error}"
+                ) from fallback_error
+
     def _create_converter(self, spec, method):
         if spec.key == "pdf_to_word":
             def convert_pdf(source, output, progress):
-                if method == "word_com":
+                if method == WORD_NATIVE and not self.is_macos:
                     pdf_to_word_via_word(
                         source, output,
                         lambda message, pct: progress(message, min(88, int(pct * 0.88))),
@@ -1878,9 +2290,45 @@ class ConverterApp:
 
         if spec.key == "word_to_pdf":
             def convert_docx(source, output, progress):
-                if word_com_available():
-                    docx_to_pdf_via_word(source, output, progress)
-                elif libreoffice_available():
+                if self.is_macos and self._method_availability(WORD_NATIVE):
+                    try:
+                        self._convert_with_macos_backend(
+                            WORD_NATIVE,
+                            self._mac_word_backend,
+                            source,
+                            output,
+                            progress,
+                        )
+                    except MacOSOfficeError as native_error:
+                        if not _engine_result_selectable(libreoffice_available()):
+                            raise
+                        output_path = Path(output)
+                        if output_path.exists():
+                            output_path.unlink()
+                        progress(
+                            "Word 原生转换失败，改用 LibreOffice 重试（详见自动化权限状态）...",
+                            5,
+                        )
+                        try:
+                            docx_to_pdf_via_libreoffice(source, output, progress)
+                        except Exception as fallback_error:
+                            raise RuntimeError(
+                                f"Word 原生转换失败：{native_error}\n"
+                                f"LibreOffice 回退也失败：{fallback_error}"
+                            ) from fallback_error
+                elif (
+                    not self.is_macos
+                    and _engine_result_selectable(word_com_available())
+                ):
+                    self._convert_with_windows_fallback(
+                        "Word",
+                        docx_to_pdf_via_word,
+                        docx_to_pdf_via_libreoffice,
+                        source,
+                        output,
+                        progress,
+                    )
+                elif _engine_result_selectable(libreoffice_available()):
                     docx_to_pdf_via_libreoffice(source, output, progress)
                 else:
                     raise RuntimeError("Word → PDF 需要 Microsoft Word 或 LibreOffice")
@@ -1889,9 +2337,45 @@ class ConverterApp:
 
         if spec.key == "powerpoint_to_pdf":
             def convert_presentation(source, output, progress):
-                if powerpoint_com_available():
-                    presentation_to_pdf_via_powerpoint(source, output, progress)
-                elif libreoffice_available():
+                if self.is_macos and self._method_availability(POWERPOINT_NATIVE):
+                    try:
+                        self._convert_with_macos_backend(
+                            POWERPOINT_NATIVE,
+                            self._mac_powerpoint_backend,
+                            source,
+                            output,
+                            progress,
+                        )
+                    except MacOSOfficeError as native_error:
+                        if not _engine_result_selectable(libreoffice_available()):
+                            raise
+                        output_path = Path(output)
+                        if output_path.exists():
+                            output_path.unlink()
+                        progress(
+                            "PowerPoint 原生转换失败，改用 LibreOffice 重试（详见自动化权限状态）...",
+                            5,
+                        )
+                        try:
+                            presentation_to_pdf_via_libreoffice(source, output, progress)
+                        except Exception as fallback_error:
+                            raise RuntimeError(
+                                f"PowerPoint 原生转换失败：{native_error}\n"
+                                f"LibreOffice 回退也失败：{fallback_error}"
+                            ) from fallback_error
+                elif (
+                    not self.is_macos
+                    and _engine_result_selectable(powerpoint_com_available())
+                ):
+                    self._convert_with_windows_fallback(
+                        "PowerPoint",
+                        presentation_to_pdf_via_powerpoint,
+                        presentation_to_pdf_via_libreoffice,
+                        source,
+                        output,
+                        progress,
+                    )
+                elif _engine_result_selectable(libreoffice_available()):
                     presentation_to_pdf_via_libreoffice(source, output, progress)
                 else:
                     raise RuntimeError(
@@ -1964,6 +2448,9 @@ class ConverterApp:
         if not cancelled:
             self.progress["value"] = 100
         self.log(f"批次结束: {summary}")
+        if self._close_after_batch:
+            self.root.destroy()
+            return
 
         details = ""
         if failed:
@@ -1986,7 +2473,26 @@ class ConverterApp:
         self._set_busy(False)
         self.progress_text_var.set("批次异常终止")
         self.log(f"批次异常终止: {error}")
+        if self._close_after_batch:
+            self.root.destroy()
+            return
         messagebox.showerror("转换错误", error)
+
+    def _on_window_close(self):
+        if self._is_converting:
+            confirmed = messagebox.askyesno(
+                "安全退出",
+                "当前文件仍在转换。是否在当前文件完成或失败后退出？\n\n"
+                "程序不会强制终止 Office、LibreOffice 或 AppleScript。",
+            )
+            if not confirmed:
+                return
+            self._close_after_batch = True
+            self.cancel_conversion()
+            self.progress_text_var.set("正在等待当前文件结束后安全退出...")
+            self.log("窗口将在当前文件结束后关闭")
+            return
+        self.root.destroy()
 
     def _set_busy(self, busy):
         self._is_converting = busy
@@ -2003,17 +2509,7 @@ class ConverterApp:
         self.remove_btn.config(
             state="normal" if self.file_tree.selection() and editable_state == "normal" else "disabled"
         )
-        target_editable = editable_state == "normal" and self.source_kind in (None, "pdf")
-        if target_editable:
-            self.target_combo.config(
-                values=(
-                    self.TARGET_DISPLAY[PDF_TARGET_WORD],
-                    self.TARGET_DISPLAY[PDF_TARGET_POWERPOINT],
-                ),
-                state="readonly",
-            )
-        else:
-            self.target_combo.config(values=(self.TARGET_DISPLAY["pdf"],), state="disabled")
+        self._refresh_target_zones()
         self.source_output_radio.config(state=editable_state)
         self.custom_output_radio.config(state=editable_state)
         browse_enabled = (
@@ -2022,7 +2518,7 @@ class ConverterApp:
         )
         self.browse_output_btn.config(state="normal" if browse_enabled else "disabled")
         can_start = (
-            self.input_paths and self._engine_detection_complete
+            self.input_paths and self._conversion_detection_ready()
             and not self._is_converting and not self._is_installing
         )
         self.convert_btn.config(state="normal" if can_start else "disabled")
@@ -2030,13 +2526,14 @@ class ConverterApp:
 
         spec = self._current_spec()
         for value, radio in self._method_widgets.items():
+            available = self._method_availability(value)
+            selectable = available is True or (
+                available is False and value in (WORD_NATIVE, "libreoffice")
+            )
             enabled = (
                 not self._is_converting and not self._is_installing
                 and (spec is None or spec.key == "pdf_to_word")
-                and (
-                    self._avail_methods.get(value, False)
-                    or value in ("word_com", "libreoffice")
-                )
+                and selectable
             )
             radio.config(state="normal" if enabled else "disabled")
 
@@ -2052,13 +2549,26 @@ class ConverterApp:
             target = self.input_paths[0].parent
 
         if target and target.is_dir():
-            os.startfile(str(target))
+            try:
+                self.platform_services.open_directory(target)
+            except Exception as exc:
+                logging.exception("Could not open output directory")
+                messagebox.showerror("无法打开目录", str(exc))
         else:
             messagebox.showinfo("提示", "当前没有可打开的输出目录")
 
 
 def main():
-    root = TkinterDnD.Tk() if TkinterDnD is not None else tk.Tk()
+    root = None
+    if TkinterDnD is not None:
+        try:
+            root = TkinterDnD.Tk()
+            root._pdf_converter_dnd_available = True
+        except Exception:
+            logging.exception("TkDND root creation failed; using standard Tk")
+    if root is None:
+        root = tk.Tk()
+        root._pdf_converter_dnd_available = False
     try:
         root.iconbitmap(default="")
     except Exception:
