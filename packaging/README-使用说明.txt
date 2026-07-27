@@ -9,7 +9,7 @@ PDF ↔ Word/PPT 批量转换工具 v0.5.0 Windows 便携版使用说明
 
 启动与添加文件
 --------------
-- 双击 PDF-Word-PPT批量转换工具-v0.5.0-便携版-x64.exe。
+- 双击 PDF-Word-PPT-Converter-v0.5.0-Portable-x64.exe。
 - 可点击添加按钮，也可把 PDF、DOCX、PPT 或 PPTX 拖入转换队列。
 - PDF 可直接拖到“PDF → Word”或“PDF → PowerPoint”目标块。
 - Word/PPT 拖入普通队列后自动转换为 PDF。
@@ -53,7 +53,7 @@ PDF → PowerPoint 说明
 校验
 ----
 SHA256SUMS.txt 包含便携版 EXE 的 SHA-256，可用 PowerShell 核对：
-Get-FileHash '.\PDF-Word-PPT批量转换工具-v0.5.0-便携版-x64.exe' -Algorithm SHA256
+Get-FileHash '.\PDF-Word-PPT-Converter-v0.5.0-Portable-x64.exe' -Algorithm SHA256
 
 许可证
 ------

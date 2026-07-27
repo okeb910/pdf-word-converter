@@ -7,7 +7,8 @@ $ErrorActionPreference = "Stop"
 $ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $VenvDir = Join-Path $ProjectDir ".venv-build"
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
-$PortableFileName = "PDF-Word-PPT批量转换工具-v0.5.0-便携版-x64.exe"
+$PortableFileName = "PDF-Word-PPT-Converter-v0.5.0-Portable-x64.exe"
+$LegacyPortableFileName = "PDF-Word-PPT批量转换工具-v0.5.0-便携版-x64.exe"
 
 function Assert-Python312X64([string]$Executable, [string]$Description) {
     & $Executable -c "import struct, sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) and struct.calcsize('P') == 8 else 1)"
@@ -61,6 +62,11 @@ if (-not (Test-Path -LiteralPath $PortableSource -PathType Leaf)) {
 }
 
 $PortableRelease = Join-Path $ReleaseDir $PortableFileName
+$LegacyPortableRelease = Join-Path $ReleaseDir $LegacyPortableFileName
+if ($LegacyPortableRelease -ne $PortableRelease -and (Test-Path -LiteralPath $LegacyPortableRelease)) {
+    Remove-Item -LiteralPath $LegacyPortableRelease -Force
+}
+
 Copy-Item -LiteralPath $PortableSource -Destination $PortableRelease -Force
 Copy-Item -LiteralPath (Join-Path $ProjectDir "packaging\README-使用说明.txt") -Destination $ReleaseDir -Force
 Copy-Item -LiteralPath (Join-Path $ProjectDir "CHANGELOG.md") -Destination $ReleaseDir -Force

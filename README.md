@@ -17,13 +17,15 @@ v0.5.0 只发布便携版。请从 [GitHub Releases](https://github.com/okeb910/
 
 | 文件 | 说明 |
 |------|------|
-| `PDF-Word-PPT批量转换工具-v0.5.0-便携版-x64.exe` | **主程序**：下载后直接双击运行，无需安装 |
+| `PDF-Word-PPT-Converter-v0.5.0-Portable-x64.exe` | **主程序**：下载后直接双击运行，无需安装 |
 | `SHA256SUMS.txt` | 便携版 EXE 的 SHA-256 校验值 |
 | `README-使用说明.txt` | 便携版使用、环境检测和校验说明 |
 | `CHANGELOG.md` | v0.5.0 更新内容、修复和已知限制 |
 | `THIRD-PARTY-LICENSES-v0.5.0.zip` | 第三方组件声明和完整许可文本 |
 
 - 支持 **64 位 Windows 10 / 11**。
+GitHub 会自动清理含中文的附件文件名，因此下载附件统一使用可稳定保留的英文文件名；Release 页面仍以中文标签标明“便携版”和各说明文件用途。
+
 - EXE 暂未数字签名，SmartScreen 可能显示“未知发布者”；可点击“更多信息”后选择“仍要运行”。
 - 便携版每次启动会先解压内置组件，再并行检测本机转换引擎；检测结果会逐项显示。
 - 启动与环境检测日志位于 `%LOCALAPPDATA%\PDFWordConverter\logs`。

@@ -55,7 +55,7 @@ portable = EXE(
     a.binaries,
     a.datas,
     [],
-    name="PDF-Word-PPT批量转换工具-v0.5.0-便携版-x64",
+    name="PDF-Word-PPT-Converter-v0.5.0-Portable-x64",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
