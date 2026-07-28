@@ -8,6 +8,7 @@ $ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $VenvDir = Join-Path $ProjectDir ".venv-build"
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
 $PortableFileName = "PDF-Word-PPT-Converter-v0.5.1-Portable-x64.exe"
+$UsageGuideFileName = "README-v0.5.1-zh-CN.txt"
 
 function Assert-Python312X64([string]$Executable, [string]$Description) {
     & $Executable -c "import struct, sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) and struct.calcsize('P') == 8 else 1)"
@@ -71,7 +72,7 @@ $UsageReadmes = @(
 if ($UsageReadmes.Count -ne 1) {
     throw "Expected exactly one packaging README text file; found $($UsageReadmes.Count)"
 }
-Copy-Item -LiteralPath $UsageReadmes[0].FullName -Destination $ReleaseDir -Force
+Copy-Item -LiteralPath $UsageReadmes[0].FullName -Destination (Join-Path $ReleaseDir $UsageGuideFileName) -Force
 Copy-Item -LiteralPath (Join-Path $ProjectDir "CHANGELOG.md") -Destination $ReleaseDir -Force
 Copy-Item -LiteralPath (Join-Path $ProjectDir "THIRD_PARTY_NOTICES.md") -Destination $ReleaseDir -Force
 Copy-Item -LiteralPath (Join-Path $ProjectDir "LICENSE") -Destination $ReleaseDir -Force

@@ -19,7 +19,7 @@ v0.5.1 只发布便携版。请从 [GitHub Releases](https://github.com/okeb910/
 |------|------|
 | `PDF-Word-PPT-Converter-v0.5.1-Portable-x64.exe` | **主程序**：下载后直接双击运行，无需安装 |
 | `SHA256SUMS.txt` | 便携版 EXE 的 SHA-256 校验值 |
-| `README-使用说明.txt` | 便携版使用、环境检测和校验说明 |
+| `README-v0.5.1-zh-CN.txt` | 中文便携版使用、环境检测和校验说明 |
 | `CHANGELOG.md` | v0.5.1 更新内容、修复和已知限制 |
 | `THIRD-PARTY-LICENSES-v0.5.1.zip` | 第三方组件声明和完整许可文本 |
 
