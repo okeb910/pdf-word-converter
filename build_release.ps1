@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$PythonExe = "python",
     [string]$ReleaseDir = ""
 )
@@ -7,8 +7,7 @@ $ErrorActionPreference = "Stop"
 $ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $VenvDir = Join-Path $ProjectDir ".venv-build"
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
-$PortableFileName = "PDF-Word-PPT-Converter-v0.5.0-Portable-x64.exe"
-$LegacyPortableFileName = "PDF-Word-PPT批量转换工具-v0.5.0-便携版-x64.exe"
+$PortableFileName = "PDF-Word-PPT-Converter-v0.5.1-Portable-x64.exe"
 
 function Assert-Python312X64([string]$Executable, [string]$Description) {
     & $Executable -c "import struct, sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) and struct.calcsize('P') == 8 else 1)"
@@ -18,7 +17,7 @@ function Assert-Python312X64([string]$Executable, [string]$Description) {
 }
 
 if (-not $ReleaseDir) {
-    $ReleaseDir = Join-Path $ProjectDir "release\v0.5.0"
+    $ReleaseDir = Join-Path $ProjectDir "release\v0.5.1"
 }
 
 Assert-Python312X64 $PythonExe "Build interpreter"
@@ -30,10 +29,13 @@ if (-not (Test-Path -LiteralPath $VenvPython)) {
 }
 Assert-Python312X64 $VenvPython "Build environment"
 
-& $VenvPython -m pip install --upgrade pip
-if ($LASTEXITCODE -ne 0) { throw "Could not upgrade pip" }
-& $VenvPython -m pip install -r (Join-Path $ProjectDir "requirements-build.txt")
+& $VenvPython -m pip install --disable-pip-version-check -r (Join-Path $ProjectDir "requirements-build.txt")
 if ($LASTEXITCODE -ne 0) { throw "Could not install build requirements" }
+
+& $VenvPython -c "import sys; sys.path.insert(0, sys.argv[1]); import docx_table_repair, pdf_fidelity" $ProjectDir
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not import required frozen modules: docx_table_repair, pdf_fidelity"
+}
 
 $BuildDir = Join-Path $ProjectDir "build"
 $DistDir = Join-Path $ProjectDir "dist"
@@ -62,13 +64,14 @@ if (-not (Test-Path -LiteralPath $PortableSource -PathType Leaf)) {
 }
 
 $PortableRelease = Join-Path $ReleaseDir $PortableFileName
-$LegacyPortableRelease = Join-Path $ReleaseDir $LegacyPortableFileName
-if ($LegacyPortableRelease -ne $PortableRelease -and (Test-Path -LiteralPath $LegacyPortableRelease)) {
-    Remove-Item -LiteralPath $LegacyPortableRelease -Force
-}
-
 Copy-Item -LiteralPath $PortableSource -Destination $PortableRelease -Force
-Copy-Item -LiteralPath (Join-Path $ProjectDir "packaging\README-使用说明.txt") -Destination $ReleaseDir -Force
+$UsageReadmes = @(
+    Get-ChildItem -LiteralPath (Join-Path $ProjectDir "packaging") -Filter "README-*.txt" -File
+)
+if ($UsageReadmes.Count -ne 1) {
+    throw "Expected exactly one packaging README text file; found $($UsageReadmes.Count)"
+}
+Copy-Item -LiteralPath $UsageReadmes[0].FullName -Destination $ReleaseDir -Force
 Copy-Item -LiteralPath (Join-Path $ProjectDir "CHANGELOG.md") -Destination $ReleaseDir -Force
 Copy-Item -LiteralPath (Join-Path $ProjectDir "THIRD_PARTY_NOTICES.md") -Destination $ReleaseDir -Force
 Copy-Item -LiteralPath (Join-Path $ProjectDir "LICENSE") -Destination $ReleaseDir -Force
@@ -79,7 +82,7 @@ if (Test-Path -LiteralPath $ReleaseLicensesDir) {
 }
 Copy-Item -LiteralPath (Join-Path $ProjectDir "packaging\licenses") -Destination $ReleaseLicensesDir -Recurse -Force
 
-$LicenseArchive = Join-Path $ReleaseDir "THIRD-PARTY-LICENSES-v0.5.0.zip"
+$LicenseArchive = Join-Path $ReleaseDir "THIRD-PARTY-LICENSES-v0.5.1.zip"
 if (Test-Path -LiteralPath $LicenseArchive) {
     Remove-Item -LiteralPath $LicenseArchive -Force
 }

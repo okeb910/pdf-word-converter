@@ -22,7 +22,7 @@ from platform_services import (
 
 
 APP_NAME = "PDFWordConverter"
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.5.1"
 
 OFFICE_WINGET_COMMAND = (
     "winget",

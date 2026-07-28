@@ -15,9 +15,11 @@ hiddenimports = [
     "app_environment",
     "batch_logic",
     "conversion_specs",
+    "docx_table_repair",
     "drop_logic",
     "engine_models",
     "macos_office",
+    "pdf_fidelity",
     "platform_services",
 ]
 
@@ -55,7 +57,7 @@ portable = EXE(
     a.binaries,
     a.datas,
     [],
-    name="PDF-Word-PPT-Converter-v0.5.0-Portable-x64",
+    name="PDF-Word-PPT-Converter-v0.5.1-Portable-x64",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -15,16 +15,22 @@ PDF → PowerPoint:
 PowerPoint → PDF:
   - Windows 使用 PowerPoint COM，macOS 使用 PowerPoint AppleScript，均可回退 LibreOffice
 """
-import os
+import hashlib
 import io
 import logging
-import sys
-import threading
+import os
 import subprocess
+import sys
+import tempfile
+import threading
 import time
 import tkinter as tk
-from tkinter import filedialog, font as tkfont, messagebox, ttk
+import unicodedata
+from collections import Counter
+from dataclasses import dataclass, field, replace
+from difflib import SequenceMatcher
 from pathlib import Path
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 try:
     from tkinterdnd2 import COPY, DND_FILES, REFUSE_DROP, TkinterDnD
@@ -49,6 +55,13 @@ from conversion_specs import (
 )
 from drop_logic import MixedSourceKindsError, classify_dropped_paths
 from macos_office import MacOSOfficeError, MacOSPowerPointBackend, MacOSWordBackend
+from pdf_fidelity import (
+    PdfFidelityAnalysisCancelled,
+    PdfFidelityRisk,
+    analyze_pdf_fidelity_risk,
+    inspect_editable_docx_tables,
+)
+from docx_table_repair import DocxTableRepairError, repair_docx_table_topology
 from platform_services import InstallerActionKind, create_platform_services
 
 
@@ -61,6 +74,816 @@ LEGACY_ENGINE_ALIASES = {
     "powerpoint_com": POWERPOINT_NATIVE,
 }
 
+@dataclass(slots=True)
+class PdfWordBatchPolicy:
+    """Per-file PDF-to-Word fidelity choices for one serial batch."""
+
+    default_method: str
+    method_overrides: dict[Path, str] = field(default_factory=dict)
+    editable_table_reports: dict[Path, PdfFidelityRisk] = field(default_factory=dict)
+    selectable_text_reports: dict[Path, PdfFidelityRisk] = field(default_factory=dict)
+    completion_warnings: dict[Path, str] = field(default_factory=dict)
+    advisory_validation_paths: set[Path] = field(default_factory=set)
+    blocked_paths: dict[Path, str] = field(default_factory=dict)
+    unverified_paths: set[Path] = field(default_factory=set)
+    image_protected_paths: set[Path] = field(default_factory=set)
+    source_identities: dict[Path, tuple[int, int, int, int, str]] = field(
+        default_factory=dict
+    )
+    source_snapshots: dict[Path, Path] = field(default_factory=dict)
+    snapshot_directories: list[object] = field(default_factory=list, repr=False)
+
+    def cleanup_snapshots(self) -> None:
+        while self.snapshot_directories:
+            temporary_directory = self.snapshot_directories.pop()
+            try:
+                temporary_directory.cleanup()
+            except OSError:
+                pass
+        self.source_snapshots.clear()
+
+
+def _source_file_identity(path) -> tuple[int, int, int, int, str]:
+    source_path = Path(path)
+    stat_before = source_path.stat()
+    digest = hashlib.sha256()
+    with source_path.open("rb") as source_stream:
+        while chunk := source_stream.read(1024 * 1024):
+            digest.update(chunk)
+    stat_after = source_path.stat()
+    metadata_before = (
+        int(getattr(stat_before, "st_dev", 0) or 0),
+        int(getattr(stat_before, "st_ino", 0) or 0),
+        int(stat_before.st_size),
+        int(stat_before.st_mtime_ns),
+    )
+    metadata_after = (
+        int(getattr(stat_after, "st_dev", 0) or 0),
+        int(getattr(stat_after, "st_ino", 0) or 0),
+        int(stat_after.st_size),
+        int(stat_after.st_mtime_ns),
+    )
+    if metadata_before != metadata_after:
+        raise RuntimeError("读取源 PDF 期间文件发生变化")
+    return (*metadata_after, digest.hexdigest())
+
+
+def _copy_verified_source_snapshot(source, destination, expected_identity):
+    """Copy the exact preflight bytes to a private conversion snapshot."""
+
+    source_path = Path(source)
+    destination_path = Path(destination)
+    digest = hashlib.sha256()
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    with source_path.open("rb") as source_stream, destination_path.open("xb") as output:
+        stat_before = os.fstat(source_stream.fileno())
+        while chunk := source_stream.read(1024 * 1024):
+            digest.update(chunk)
+            output.write(chunk)
+        output.flush()
+        os.fsync(output.fileno())
+        stat_after = os.fstat(source_stream.fileno())
+    metadata_before = (
+        int(getattr(stat_before, "st_dev", 0) or 0),
+        int(getattr(stat_before, "st_ino", 0) or 0),
+        int(stat_before.st_size),
+        int(stat_before.st_mtime_ns),
+    )
+    metadata_after = (
+        int(getattr(stat_after, "st_dev", 0) or 0),
+        int(getattr(stat_after, "st_ino", 0) or 0),
+        int(stat_after.st_size),
+        int(stat_after.st_mtime_ns),
+    )
+    copied_identity = (*metadata_after, digest.hexdigest())
+    if metadata_before != metadata_after or copied_identity != expected_identity:
+        destination_path.unlink(missing_ok=True)
+        raise RuntimeError("源 PDF 在创建转换快照期间发生变化，请重新加入后再转换")
+    return destination_path
+
+
+def _normalize_table_text(value) -> str:
+    characters = []
+    for character in unicodedata.normalize("NFC", str(value or "")):
+        if unicodedata.category(character).startswith("P"):
+            compatible = unicodedata.normalize("NFKC", character)
+            if (
+                len(compatible) == 1
+                and unicodedata.category(compatible).startswith("P")
+            ):
+                character = compatible
+        characters.append(character)
+
+    normalized = []
+    for index, character in enumerate(characters):
+        if character in "\r\n\v\f":
+            continue
+        if not character.isspace():
+            normalized.append(character)
+            continue
+
+        previous = next(
+            (
+                value
+                for value in reversed(normalized)
+                if not value.isspace()
+            ),
+            "",
+        )
+        following = next(
+            (
+                value
+                for value in characters[index + 1 :]
+                if not value.isspace()
+            ),
+            "",
+        )
+        preserve_space = bool(
+            previous
+            and following
+            and previous.isascii()
+            and following.isascii()
+            and previous.isalnum()
+            and following.isalnum()
+        )
+        if preserve_space and (not normalized or normalized[-1] != " "):
+            normalized.append(" ")
+    return "".join(normalized).strip()
+
+
+def _document_text_evidence_matches(
+    source_text,
+    output_text,
+    *,
+    source_character_count=None,
+    output_character_count=None,
+) -> bool:
+    if source_text is None or output_text is None:
+        return False
+    source_text = str(source_text)
+    output_text = str(output_text)
+    measured_source_count = sum(
+        not character.isspace() for character in source_text
+    )
+    measured_output_count = sum(
+        not character.isspace() for character in output_text
+    )
+    if (
+        source_character_count is not None
+        and measured_source_count != int(source_character_count)
+    ):
+        return False
+    if (
+        output_character_count is not None
+        and measured_output_count != int(output_character_count)
+    ):
+        return False
+    normalized_source = _normalize_table_text(source_text)
+    normalized_output = _normalize_table_text(output_text)
+    return bool(
+        len(normalized_source) == len(normalized_output)
+        and Counter(normalized_source) == Counter(normalized_output)
+    )
+
+
+def _ordered_text_overlap_ratio(source_text, output_text) -> float:
+    if not source_text:
+        return 1.0
+    if len(source_text) <= 20000 and len(output_text) <= 50000:
+        matching_characters = sum(
+            block.size
+            for block in SequenceMatcher(
+                None,
+                source_text,
+                output_text,
+                autojunk=False,
+            ).get_matching_blocks()
+        )
+        return matching_characters / len(source_text)
+
+    gram_size = 3 if len(source_text) >= 3 else 1
+    source_grams = Counter(
+        source_text[index : index + gram_size]
+        for index in range(len(source_text) - gram_size + 1)
+    )
+    output_grams = Counter(
+        output_text[index : index + gram_size]
+        for index in range(len(output_text) - gram_size + 1)
+    )
+    matching_grams = sum((source_grams & output_grams).values())
+    return matching_grams / max(1, sum(source_grams.values()))
+
+
+def _table_texts_preserved(source_texts, output_texts, minimum_ratio=0.8):
+    sources = [
+        text
+        for text in (_normalize_table_text(value) for value in source_texts)
+        if text
+    ]
+    outputs = {
+        index: text
+        for index, text in enumerate(
+            _normalize_table_text(value) for value in output_texts
+        )
+        if text
+    }
+    matched = 0
+    for source_text in sorted(sources, key=len, reverse=True):
+        source_characters = Counter(source_text)
+        best_index = None
+        best_score = -1.0
+        for index, output_text in outputs.items():
+            character_overlap = sum(
+                (source_characters & Counter(output_text)).values()
+            ) / len(source_text)
+            ordered_overlap = _ordered_text_overlap_ratio(
+                source_text,
+                output_text,
+            )
+            score = min(character_overlap, ordered_overlap)
+            if score > best_score:
+                best_index = index
+                best_score = score
+        if best_index is None or best_score < float(minimum_ratio):
+            return False, matched, len(sources)
+        outputs.pop(best_index)
+        matched += 1
+    return True, matched, len(sources)
+
+
+def _coerce_table_shape(value):
+    try:
+        rows, columns = value
+        rows = int(rows)
+        columns = int(columns)
+    except (TypeError, ValueError):
+        return None
+    if rows < 1 or columns < 1:
+        return None
+    return rows, columns
+
+
+def _coerce_table_cell_count(value):
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return None
+    return count if count > 0 else None
+
+
+def _coerce_table_cell_spans(value, shape):
+    shape = _coerce_table_shape(shape)
+    if shape is None:
+        return None
+    try:
+        spans = tuple(
+            tuple(int(component) for component in span)
+            for span in value
+        )
+    except (TypeError, ValueError):
+        return None
+    rows, columns = shape
+    coverage = [[False] * columns for _row in range(rows)]
+    for span in spans:
+        if len(span) != 4:
+            return None
+        row, column, row_span, column_span = span
+        if (
+            row < 0
+            or column < 0
+            or row_span < 1
+            or column_span < 1
+            or row + row_span > rows
+            or column + column_span > columns
+        ):
+            return None
+        for covered_row in range(row, row + row_span):
+            for covered_column in range(column, column + column_span):
+                if coverage[covered_row][covered_column]:
+                    return None
+                coverage[covered_row][covered_column] = True
+    if not spans or not all(all(row) for row in coverage):
+        return None
+    return tuple(sorted(spans))
+
+
+def _coerce_table_cell_border_map(value, spans, shape):
+    normalized_spans = _coerce_table_cell_spans(spans, shape)
+    if normalized_spans is None:
+        return None
+    try:
+        ordered_spans = tuple(
+            tuple(int(component) for component in span)
+            for span in spans
+        )
+        border_edges = tuple(tuple(edges) for edges in value)
+    except (TypeError, ValueError):
+        return None
+    if len(ordered_spans) != len(normalized_spans) or len(border_edges) != len(
+        ordered_spans
+    ):
+        return None
+    if any(
+        len(edges) != 4 or any(type(edge) is not bool for edge in edges)
+        for edges in border_edges
+    ):
+        return None
+    return tuple(
+        sorted(
+            zip(ordered_spans, border_edges),
+            key=lambda item: item[0],
+        )
+    )
+
+
+def _coerce_table_cell_matrix(value, shape):
+    shape = _coerce_table_shape(shape)
+    if shape is None:
+        return None
+    try:
+        rows = tuple(tuple(row) for row in value)
+    except TypeError:
+        return None
+    expected_rows, expected_columns = shape
+    if (
+        len(rows) != expected_rows
+        or any(len(row) != expected_columns for row in rows)
+    ):
+        return None
+    return tuple(
+        tuple(None if cell is None else str(cell) for cell in row)
+        for row in rows
+    )
+
+
+def _table_cell_matrix_text(matrix) -> str:
+    return "".join(
+        str(cell or "")
+        for row in matrix
+        for cell in row
+        if cell is not None
+    )
+
+
+def _table_cell_matrix_matches_text(matrix, shape, table_text) -> bool:
+    coerced = _coerce_table_cell_matrix(matrix, shape)
+    return bool(
+        coerced is not None
+        and _normalize_table_text(_table_cell_matrix_text(coerced))
+        == _normalize_table_text(table_text)
+    )
+
+
+def _table_cell_matrix_preserved(
+    source_matrix,
+    output_matrix,
+    source_shape,
+    output_shape,
+    source_full_width_span_rows=None,
+) -> bool:
+    del source_full_width_span_rows
+    source = _coerce_table_cell_matrix(source_matrix, source_shape)
+    output = _coerce_table_cell_matrix(output_matrix, output_shape)
+    if source is None or output is None or source_shape != output_shape:
+        return False
+    for source_row, output_row in zip(source, output):
+        for source_value, output_value in zip(source_row, output_row):
+            if (source_value is None) != (output_value is None):
+                return False
+            if source_value is not None and (
+                _normalize_table_text(source_value)
+                != _normalize_table_text(output_value)
+            ):
+                return False
+    return True
+def _table_pair_preserved(
+    source_text,
+    source_shape,
+    source_cell_count,
+    output_text,
+    output_shape,
+    output_cell_count,
+    minimum_ratio=0.98,
+    source_cell_matrix=None,
+    output_cell_matrix=None,
+    source_full_width_span_rows=None,
+    source_cell_spans=None,
+    output_cell_spans=None,
+):
+    source_text = _normalize_table_text(source_text)
+    output_text = _normalize_table_text(output_text)
+    source_shape = _coerce_table_shape(source_shape)
+    output_shape = _coerce_table_shape(output_shape)
+    source_cell_count = _coerce_table_cell_count(source_cell_count)
+    output_cell_count = _coerce_table_cell_count(output_cell_count)
+    if (
+        source_shape is None
+        or output_shape is None
+        or source_cell_count is None
+        or output_cell_count is None
+        or source_shape != output_shape
+        or output_cell_count != source_cell_count
+    ):
+        return False
+
+    if (source_cell_spans is None) != (output_cell_spans is None):
+        return False
+    if source_cell_spans is not None:
+        source_spans = _coerce_table_cell_spans(
+            source_cell_spans,
+            source_shape,
+        )
+        output_spans = _coerce_table_cell_spans(
+            output_cell_spans,
+            output_shape,
+        )
+        if source_spans is None or source_spans != output_spans:
+            return False
+
+    if (source_cell_matrix is None) != (output_cell_matrix is None):
+        return False
+    matrix_verified = False
+    if source_cell_matrix is not None:
+        if not _table_cell_matrix_preserved(
+            source_cell_matrix,
+            output_cell_matrix,
+            source_shape,
+            output_shape,
+            source_full_width_span_rows=source_full_width_span_rows,
+        ):
+            return False
+        matrix_verified = True
+
+    # A confirmed blank grid has no text to compare, but its exact row, column,
+    # cell and merge matrices still prove that it remains an editable table.
+    if not source_text or not output_text:
+        return bool(matrix_verified and not source_text and not output_text)
+
+    source_characters = Counter(source_text)
+    character_overlap = sum(
+        (source_characters & Counter(output_text)).values()
+    ) / len(source_text)
+    ordered_overlap = _ordered_text_overlap_ratio(source_text, output_text)
+    text_size_similarity = min(len(source_text), len(output_text)) / max(
+        len(source_text), len(output_text)
+    )
+    return min(
+        character_overlap,
+        ordered_overlap,
+        text_size_similarity,
+    ) >= max(0.98, float(minimum_ratio))
+
+def _ordered_source_residual(source_text, matched_output_text):
+    """Return source character positions not covered by the matched main table."""
+
+    source_text = _normalize_table_text(source_text)
+    matched_output_text = _normalize_table_text(matched_output_text)
+    if len(source_text) > 20000 or len(matched_output_text) > 50000:
+        return None
+
+    covered = bytearray(len(source_text))
+    matcher = SequenceMatcher(
+        None,
+        source_text,
+        matched_output_text,
+        autojunk=False,
+    )
+    for block in matcher.get_matching_blocks():
+        for index in range(block.a, block.a + block.size):
+            covered[index] = 1
+    return "".join(
+        character
+        for index, character in enumerate(source_text)
+        if not covered[index]
+    )
+
+
+def _table_structure_gap(source_shape, source_cell_count, output_shape, output_cell_count):
+    source_shape = _coerce_table_shape(source_shape)
+    output_shape = _coerce_table_shape(output_shape)
+    source_cell_count = _coerce_table_cell_count(source_cell_count)
+    output_cell_count = _coerce_table_cell_count(output_cell_count)
+    if (
+        source_shape is None
+        or output_shape is None
+        or source_cell_count is None
+        or output_cell_count is None
+    ):
+        return float("inf")
+
+    source_rows, source_columns = source_shape
+    output_rows, output_columns = output_shape
+    source_area = source_rows * source_columns
+    output_area = output_rows * output_columns
+    return (
+        abs(source_rows - output_rows) / source_rows
+        + abs(source_columns - output_columns) / source_columns
+        + abs(source_area - output_area) / source_area
+        + abs(source_cell_count - output_cell_count) / source_cell_count
+    )
+
+
+def _fragment_reduces_structure_gap(
+    source_shape,
+    source_cell_count,
+    matched_shape,
+    matched_cell_count,
+    fragment_shape,
+    fragment_cell_count,
+):
+    matched_shape = _coerce_table_shape(matched_shape)
+    fragment_shape = _coerce_table_shape(fragment_shape)
+    matched_cell_count = _coerce_table_cell_count(matched_cell_count)
+    fragment_cell_count = _coerce_table_cell_count(fragment_cell_count)
+    if (
+        matched_shape is None
+        or fragment_shape is None
+        or matched_cell_count is None
+        or fragment_cell_count is None
+    ):
+        return False
+
+    before = _table_structure_gap(
+        source_shape,
+        source_cell_count,
+        matched_shape,
+        matched_cell_count,
+    )
+    vertical_shape = (
+        matched_shape[0] + fragment_shape[0],
+        max(matched_shape[1], fragment_shape[1]),
+    )
+    horizontal_shape = (
+        max(matched_shape[0], fragment_shape[0]),
+        matched_shape[1] + fragment_shape[1],
+    )
+    combined_cells = matched_cell_count + fragment_cell_count
+    after = min(
+        _table_structure_gap(
+            source_shape,
+            source_cell_count,
+            vertical_shape,
+            combined_cells,
+        ),
+        _table_structure_gap(
+            source_shape,
+            source_cell_count,
+            horizontal_shape,
+            combined_cells,
+        ),
+    )
+    return after < before
+
+
+def _fragment_residual_positions(residual, candidate):
+    residual = _normalize_table_text(residual)
+    candidate = _normalize_table_text(candidate)
+    if not residual or not candidate:
+        return frozenset()
+    if len(residual) > 20000 or len(candidate) > 50000:
+        return frozenset(range(len(residual)))
+
+    matcher = SequenceMatcher(None, residual, candidate, autojunk=False)
+    positions = {
+        index
+        for block in matcher.get_matching_blocks()
+        for index in range(block.a, block.a + block.size)
+    }
+    character_hits = sum(
+        (Counter(residual) & Counter(candidate)).values()
+    )
+    membership = min(character_hits, len(positions)) / len(candidate)
+    required_membership = 1.0 if len(candidate) <= 3 else 0.8
+    return frozenset(positions) if membership >= required_membership else frozenset()
+
+def _unmatched_table_looks_like_source_fragment(
+    source_text,
+    source_shape,
+    source_cell_count,
+    matched_output_text,
+    matched_output_shape,
+    matched_output_cell_count,
+    unmatched_output_text,
+    unmatched_output_shape,
+    unmatched_output_cell_count,
+):
+    residual = _ordered_source_residual(source_text, matched_output_text)
+    if residual is None:
+        return bool(_normalize_table_text(unmatched_output_text))
+    if not residual:
+        return False
+
+    candidate = _normalize_table_text(unmatched_output_text)
+    if not candidate:
+        return False
+    residual_positions = _fragment_residual_positions(residual, candidate)
+    if not residual_positions:
+        return False
+    if len(residual_positions) >= len(residual):
+        return True
+    if len(candidate) > 3:
+        return True
+    return _fragment_reduces_structure_gap(
+        source_shape,
+        source_cell_count,
+        matched_output_shape,
+        matched_output_cell_count,
+        unmatched_output_shape,
+        unmatched_output_cell_count,
+    )
+
+def _table_structures_preserved(
+    source_texts,
+    source_shapes,
+    source_cell_counts,
+    output_texts,
+    output_shapes,
+    output_cell_counts,
+    source_cell_matrices=None,
+    output_cell_matrices=None,
+    source_full_width_span_rows=None,
+    source_cell_spans=None,
+    output_cell_spans=None,
+    minimum_ratio=0.98,
+):
+    """Match source tables to complete editable Word tables in reading order."""
+
+    source_texts = tuple(source_texts or ())
+    source_shapes = tuple(source_shapes or ())
+    source_cell_counts = tuple(source_cell_counts or ())
+    output_texts = tuple(output_texts or ())
+    output_shapes = tuple(output_shapes or ())
+    output_cell_counts = tuple(output_cell_counts or ())
+    matrices_requested = (
+        source_cell_matrices is not None
+        or output_cell_matrices is not None
+    )
+    if matrices_requested and (
+        source_cell_matrices is None
+        or output_cell_matrices is None
+    ):
+        return False, 0, len(source_texts)
+    source_cell_matrices = (
+        tuple(source_cell_matrices or ())
+        if matrices_requested
+        else ()
+    )
+    output_cell_matrices = (
+        tuple(output_cell_matrices or ())
+        if matrices_requested
+        else ()
+    )
+    spans_requested = source_cell_spans is not None or output_cell_spans is not None
+    if spans_requested and (
+        source_cell_spans is None or output_cell_spans is None
+    ):
+        return False, 0, len(source_texts)
+    source_cell_spans = (
+        tuple(source_cell_spans or ()) if spans_requested else ()
+    )
+    output_cell_spans = (
+        tuple(output_cell_spans or ()) if spans_requested else ()
+    )
+    source_count = len(source_texts)
+    if source_full_width_span_rows is None:
+        source_full_width_span_rows = tuple(
+            (False,) * int(shape[0])
+            for shape in source_shapes
+            if _coerce_table_shape(shape) is not None
+        )
+    else:
+        try:
+            source_full_width_span_rows = tuple(
+                tuple(bool(value) for value in table_rows)
+                for table_rows in source_full_width_span_rows
+            )
+        except TypeError:
+            return False, 0, source_count
+    if (
+        not source_count
+        or len(source_shapes) != source_count
+        or len(source_cell_counts) != source_count
+        or len(output_texts) != len(output_shapes)
+        or len(output_texts) != len(output_cell_counts)
+        or len(source_full_width_span_rows) != source_count
+        or any(
+            len(table_rows) != int(shape[0])
+            for table_rows, shape in zip(
+                source_full_width_span_rows,
+                source_shapes,
+            )
+            if _coerce_table_shape(shape) is not None
+        )
+        or (
+            matrices_requested
+            and (
+                len(source_cell_matrices) != source_count
+                or len(output_cell_matrices) != len(output_texts)
+            )
+        )
+        or (
+            spans_requested
+            and (
+                len(source_cell_spans) != source_count
+                or len(output_cell_spans) != len(output_texts)
+            )
+        )
+    ):
+        return False, 0, source_count
+
+    best_paths = [()] * (len(output_texts) + 1)
+    for source_index, (source_text, source_shape, source_cell_count) in enumerate(
+        zip(source_texts, source_shapes, source_cell_counts),
+        start=1,
+    ):
+        next_paths = best_paths.copy()
+        for output_index, (output_text, output_shape, output_cell_count) in enumerate(
+            zip(output_texts, output_shapes, output_cell_counts),
+            start=1,
+        ):
+            if len(next_paths[output_index - 1]) > len(next_paths[output_index]):
+                next_paths[output_index] = next_paths[output_index - 1]
+            if (
+                len(best_paths[output_index - 1]) == source_index - 1
+                and _table_pair_preserved(
+                    source_text,
+                    source_shape,
+                    source_cell_count,
+                    output_text,
+                    output_shape,
+                    output_cell_count,
+                    minimum_ratio=minimum_ratio,
+                    source_cell_matrix=(
+                        source_cell_matrices[source_index - 1]
+                        if matrices_requested
+                        else None
+                    ),
+                    output_cell_matrix=(
+                        output_cell_matrices[output_index - 1]
+                        if matrices_requested
+                        else None
+                    ),
+                    source_full_width_span_rows=(
+                        source_full_width_span_rows[source_index - 1]
+                    ),
+                    source_cell_spans=(
+                        source_cell_spans[source_index - 1]
+                        if spans_requested
+                        else None
+                    ),
+                    output_cell_spans=(
+                        output_cell_spans[output_index - 1]
+                        if spans_requested
+                        else None
+                    ),
+                )
+            ):
+                candidate = best_paths[output_index - 1] + (output_index - 1,)
+                if len(candidate) > len(next_paths[output_index]):
+                    next_paths[output_index] = candidate
+        best_paths = next_paths
+
+    best_path = max(best_paths, key=len, default=())
+    matched = len(best_path)
+    if matched != source_count:
+        return False, matched, source_count
+
+    matched_outputs = set(best_path)
+    normalized_outputs = tuple(_normalize_table_text(text) for text in output_texts)
+    unmatched_output_indices = tuple(
+        output_index
+        for output_index, output_text in enumerate(normalized_outputs)
+        if output_index not in matched_outputs and output_text
+    )
+    for source_index, matched_output_index in enumerate(best_path):
+        residual = _ordered_source_residual(
+            source_texts[source_index],
+            output_texts[matched_output_index],
+        )
+        aggregate_residual_positions = set()
+        for unmatched_output_index in unmatched_output_indices:
+            if residual is not None:
+                aggregate_residual_positions.update(
+                    _fragment_residual_positions(
+                        residual,
+                        output_texts[unmatched_output_index],
+                    )
+                )
+            if _unmatched_table_looks_like_source_fragment(
+                source_texts[source_index],
+                source_shapes[source_index],
+                source_cell_counts[source_index],
+                output_texts[matched_output_index],
+                output_shapes[matched_output_index],
+                output_cell_counts[matched_output_index],
+                output_texts[unmatched_output_index],
+                output_shapes[unmatched_output_index],
+                output_cell_counts[unmatched_output_index],
+            ):
+                return False, max(0, matched - 1), source_count
+        if residual and len(aggregate_residual_positions) >= len(residual):
+            return False, max(0, matched - 1), source_count
+    return True, matched, source_count
 
 def _canonical_engine_key(key: str) -> str:
     return LEGACY_ENGINE_ALIASES.get(key, key)
@@ -424,56 +1247,90 @@ def pdf_to_word_via_images(pdf_path: str, docx_path: str, progress, dpi: int = 3
     """
     fitz = _load_pymupdf()
     from docx import Document
-    from docx.shared import Inches, Cm
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Inches, Cm, Pt
     from docx.enum.text import WD_ALIGN_PARAGRAPH
 
     progress("正在读取 PDF...", 5)
     pdf_doc = fitz.open(pdf_path)
-    total_pages = len(pdf_doc)
+    try:
+        total_pages = len(pdf_doc)
+        if total_pages == 0:
+            raise RuntimeError("PDF 没有可转换的页面")
 
-    word_doc = Document()
+        word_doc = Document()
+        word_doc.core_properties.title = Path(pdf_path).stem
 
-    for i in range(total_pages):
-        progress(f"渲染第 {i + 1}/{total_pages} 页为图片...",
-                  int(5 + (i / total_pages) * 80))
+        settings = word_doc.settings.element
+        if settings.find(qn("w:doNotAutoCompressPictures")) is None:
+            settings.append(OxmlElement("w:doNotAutoCompressPictures"))
 
-        page = pdf_doc[i]
-        pix = page.get_pixmap(dpi=dpi)
-        img_bytes = pix.tobytes("png")
+        for i in range(total_pages):
+            progress(
+                f"渲染第 {i + 1}/{total_pages} 页为图片...",
+                int(5 + (i / total_pages) * 80),
+            )
 
-        page_w_inch = page.rect.width / 72
-        page_h_inch = page.rect.height / 72
+            page = pdf_doc[i]
+            render_dpi = calculate_adaptive_dpi(
+                page.rect.width,
+                page.rect.height,
+                base_dpi=dpi,
+                max_dimension_px=6000,
+                max_pixels=30_000_000,
+            )
+            pix = page.get_pixmap(
+                dpi=render_dpi,
+                colorspace=fitz.csRGB,
+                alpha=False,
+            )
+            img_bytes = pix.tobytes("png")
 
-        # 获取或创建 section 和段落
-        if i == 0:
-            section = word_doc.sections[0]
-            para = word_doc.add_paragraph()
-        else:
-            # 分节符段落属于前一节；图片必须放到它后面的新段落。
-            section = word_doc.add_section()
-            para = word_doc.add_paragraph()
+            page_w_inch = page.rect.width / 72
+            page_h_inch = page.rect.height / 72
+            page_scale = min(1.0, 22.0 / max(page_w_inch, page_h_inch))
+            page_w_inch *= page_scale
+            page_h_inch *= page_scale
 
-        section.page_width = Inches(page_w_inch)
-        section.page_height = Inches(page_h_inch)
-        section.top_margin = Cm(0)
-        section.bottom_margin = Cm(0)
-        section.left_margin = Cm(0)
-        section.right_margin = Cm(0)
+            if i == 0:
+                section = word_doc.sections[0]
+                para = word_doc.add_paragraph()
+            else:
+                # The section-break paragraph belongs to the previous section;
+                # the page image must be placed in a new paragraph after it.
+                section = word_doc.add_section()
+                para = word_doc.add_paragraph()
 
-        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        pf = para.paragraph_format
-        pf.space_before = Cm(0)
-        pf.space_after = Cm(0)
-        pf.line_spacing = 1.0
+            section.page_width = Inches(page_w_inch)
+            section.page_height = Inches(page_h_inch)
+            section.top_margin = Cm(0)
+            section.bottom_margin = Cm(0)
+            section.left_margin = Cm(0)
+            section.right_margin = Cm(0)
+            section.header_distance = Cm(0)
+            section.footer_distance = Cm(0)
 
-        run = para.add_run()
-        stream = io.BytesIO(img_bytes)
-        run.add_picture(stream, width=Inches(page_w_inch))
+            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            pf = para.paragraph_format
+            pf.space_before = Cm(0)
+            pf.space_after = Cm(0)
+            pf.line_spacing = 1.0
+            pf.keep_together = True
 
-    pdf_doc.close()
+            run = para.add_run()
+            run.font.size = Pt(1)
+            stream = io.BytesIO(img_bytes)
+            run.add_picture(
+                stream,
+                width=Inches(page_w_inch),
+                height=Inches(page_h_inch),
+            )
 
-    progress("正在保存 Word 文档...", 90)
-    word_doc.save(docx_path)
+        progress("正在保存 Word 文档...", 90)
+        word_doc.save(docx_path)
+    finally:
+        pdf_doc.close()
     progress("完成", 100)
 
 
@@ -482,17 +1339,40 @@ def calculate_adaptive_dpi(
     page_height_points: float,
     base_dpi: int = 200,
     max_dimension_px: int = 3200,
+    max_pixels: int | None = None,
 ) -> int:
     """Return a high-quality DPI while bounding unusually large PDF pages."""
     width_points = float(page_width_points)
     height_points = float(page_height_points)
     if width_points <= 0 or height_points <= 0:
         raise ValueError("PDF 页面尺寸无效")
+    if base_dpi <= 0 or max_dimension_px <= 0:
+        raise ValueError("渲染分辨率限制必须大于 0")
+    if max_pixels is not None and max_pixels <= 0:
+        raise ValueError("最大像素数必须大于 0")
     longest_points = max(width_points, height_points)
     projected = longest_points / 72 * base_dpi
-    if projected <= max_dimension_px:
-        return base_dpi
-    return max(1, int(base_dpi * max_dimension_px / projected))
+    dimension_dpi = float(base_dpi)
+    if projected > max_dimension_px:
+        dimension_dpi = base_dpi * max_dimension_px / projected
+
+    pixel_dpi = float(base_dpi)
+    if max_pixels is not None:
+        projected_pixels = (
+            width_points / 72 * base_dpi
+        ) * (
+            height_points / 72 * base_dpi
+        )
+        if projected_pixels > max_pixels:
+            pixel_dpi = (
+                base_dpi * (max_pixels / projected_pixels) ** 0.5
+            )
+    safe_dpi = min(float(base_dpi), dimension_dpi, pixel_dpi)
+    if safe_dpi < 1:
+        raise ValueError(
+            "PDF 页面尺寸过大，即使按 1 DPI 渲染也会超过安全像素限制"
+        )
+    return max(1, int(safe_dpi))
 
 
 def _presentation_canvas_size(page_width_points: float, page_height_points: float):
@@ -759,132 +1639,17 @@ def docx_to_pdf_via_libreoffice(docx_path: str, pdf_path: str, progress) -> None
     progress("完成", 100)
 
 
-# ═══════════════════════════════════════════════════════════
-#  后处理：修复转换常见问题
-# ═══════════════════════════════════════════════════════════
+# Kept as a compatibility shim for callers of earlier releases. The old
+# implementation rewrote table widths, typography and punctuation using
+# document-specific guesses, which can damage an otherwise usable conversion.
+# v0.5.1 preserves the conversion engine's DOCX byte-for-byte instead.
 
 def fix_converted_docx(docx_path: str, progress=None) -> None:
-    """对转换后的 DOCX 自动修复常见问题：
-    1. 相邻单字母大小差异 → 小字母加下标
-    2. 表格单元格字号统一
-    3. 表格中去掉错误的 superscript
-    4. 全角括号 （ ）→ 半角 ( ) 统一
-    5. 短横 － 去上标
-    """
-    from docx import Document
-    from docx.oxml.ns import qn
-    from docx.shared import Pt
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from collections import Counter
-
+    """Deprecated no-op that preserves the engine-produced DOCX unchanged."""
+    if not Path(docx_path).is_file():
+        raise FileNotFoundError(docx_path)
     if progress:
-        progress("正在自动修复格式...", 92)
-
-    doc = Document(docx_path)
-
-    # ── 1. 修复正文相邻单字母下标 ──
-    for p in doc.paragraphs:
-        runs = p.runs
-        ri = 0
-        while ri < len(runs) - 1:
-            r1, r2 = runs[ri], runs[ri + 1]
-            t1, t2 = r1.text.strip(), r2.text.strip()
-            s1, s2 = r1.font.size, r2.font.size
-            if (t1 and t2 and s1 and s2
-                    and len(t1) == 1 and len(t2) == 1
-                    and t1.isalpha() and t2.isalpha()):
-                if 0.3 < s2 / s1 < 0.85:
-                    # r2 is smaller → make it subscript
-                    rpr = r2._element.find(qn('w:rPr'))
-                    if rpr is None:
-                        rpr = r2._element.makeelement(qn('w:rPr'), {})
-                        r2._element.insert(0, rpr)
-                    for old_va in rpr.findall(qn('w:vertAlign')):
-                        rpr.remove(old_va)
-                    va = rpr.makeelement(qn('w:vertAlign'), {qn('w:val'): 'subscript'})
-                    rpr.append(va)
-                    # Ensure r1 is not superscript
-                    rpr1 = r1._element.find(qn('w:rPr'))
-                    if rpr1 is not None:
-                        for old_va in rpr1.findall(qn('w:vertAlign')):
-                            rpr1.remove(old_va)
-            ri += 1
-
-    # ── 2 & 3 & 4 & 5. 修复表格 ──
-    for table in doc.tables:
-        # 收集列宽（用于统一）
-        col_widths = []
-        if table.rows:
-            for ci, cell in enumerate(table.rows[0].cells):
-                tcPr = cell._tc.find(qn('w:tcPr'))
-                if tcPr is not None:
-                    tcW = tcPr.find(qn('w:tcW'))
-                    if tcW is not None:
-                        col_widths.append((tcW.get(qn('w:w')), tcW.get(qn('w:type'))))
-                    else:
-                        col_widths.append(None)
-                else:
-                    col_widths.append(None)
-
-        for row in table.rows:
-            for ci, cell in enumerate(row.cells):
-                # 收集字号并找到最优目标
-                sizes = []
-                all_runs = []
-                for cp in cell.paragraphs:
-                    for r in cp.runs:
-                        if r.text.strip() and r.font.size:
-                            sizes.append(r.font.size)
-                            all_runs.append(r)
-
-                if len(set(sizes)) > 1:
-                    # 取最小号作为目标（大号通常是 pdf2docx 误放大）
-                    target_size = min(sizes)
-                    for r in all_runs:
-                        r.font.size = target_size
-
-                # 去 superscript、转换全角括号、修短横
-                for cp in cell.paragraphs:
-                    for r in cp.runs:
-                        rpr = r._element.find(qn('w:rPr'))
-                        # 去 superscript
-                        if rpr is not None:
-                            for va in list(rpr.findall(qn('w:vertAlign'))):
-                                if va.get(qn('w:val')) == 'superscript':
-                                    rpr.remove(va)
-                        # 转全角括号
-                        t_els = r._element.findall(qn('w:t'))
-                        for t_el in t_els:
-                            if t_el.text and ('（' in t_el.text or '）' in t_el.text):
-                                t_el.text = t_el.text.replace('（', '(').replace('）', ')')
-                        # 去短横上标
-                        if r.text.strip() in ('－', '-', '–', '—'):
-                            if rpr is not None:
-                                for va in list(rpr.findall(qn('w:vertAlign'))):
-                                    rpr.remove(va)
-
-                # 统一列宽
-                if ci < len(col_widths) and col_widths[ci] is not None:
-                    tcPr = cell._tc.find(qn('w:tcPr'))
-                    if tcPr is None:
-                        tcPr = cell._tc.makeelement(qn('w:tcPr'), {})
-                        cell._tc.insert(0, tcPr)
-                    for old_tcw in tcPr.findall(qn('w:tcW')):
-                        tcPr.remove(old_tcw)
-                    w_val, w_type = col_widths[ci]
-                    tcW = tcPr.makeelement(qn('w:tcW'), {qn('w:w'): w_val, qn('w:type'): w_type})
-                    tcPr.append(tcW)
-
-        # 统一表格内 C2 列对齐（去掉 JUSTIFY）
-        for row in table.rows:
-            if 2 < len(row.cells):
-                for p in row.cells[2].paragraphs:
-                    if p.alignment == WD_ALIGN_PARAGRAPH.JUSTIFY:
-                        p.alignment = None
-
-    doc.save(docx_path)
-    if progress:
-        progress("格式修复完成", 95)
+        progress("已保留转换引擎原始排版", 95)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -962,6 +1727,8 @@ class ConverterApp:
         self._is_installing = False
         self._winget_path = None
         self._cancel_event = threading.Event()
+        self._cancel_wait_started_at = None
+        self._cancel_wait_after_id = None
         self._close_after_batch = False
         self._setup_ui()
         self._detect_engines()
@@ -1119,10 +1886,10 @@ class ConverterApp:
         self.word_method_container = tk.Frame(self.method_frame, bg="#f5f5f5")
         methods_desc = []
         if not self.is_macos:
-            methods_desc.append((WORD_NATIVE, "Microsoft Word 原生转换（推荐，可编辑）"))
+            methods_desc.append((WORD_NATIVE, "可编辑优先：Microsoft Word 原生转换（复杂表格可能重排）"))
         methods_desc.extend([
-            ("images", "页面转高清图片嵌入（观感接近，不可编辑）"),
-            ("libreoffice", "LibreOffice 引擎（兼容性有限）"),
+            ("images", "仅扫描件/纯图形：整页高清图片（文字和表格不可编辑）"),
+            ("libreoffice", "兼容模式：LibreOffice（可编辑性与版式有限）"),
         ])
         for value, description in methods_desc:
             row = tk.Frame(self.word_method_container, bg="#f5f5f5")
@@ -1701,7 +2468,21 @@ class ConverterApp:
         if spec is None:
             return False
         if spec.key == "pdf_to_word":
-            return self._method_availability(self.method_var.get()) is not None
+            selected_state = self._method_availability(self.method_var.get())
+            if self.method_var.get() == "images":
+                if selected_state is None:
+                    return False
+                libreoffice_state = self._method_availability("libreoffice")
+                if self.is_macos:
+                    return libreoffice_state is not None
+                word_state = self._method_availability(WORD_NATIVE)
+                return word_state is True or (
+                    word_state is False and libreoffice_state is not None
+                )
+            return (
+                selected_state is not None
+                and self._method_availability("images") is not None
+            )
         if spec.key == "pdf_to_powerpoint":
             return (
                 self._method_availability("images") is not None
@@ -1932,6 +2713,48 @@ class ConverterApp:
         completed.wait()
         return answer["value"]
 
+    def _cancel_requested(self):
+        cancel_event = getattr(self, "_cancel_event", None)
+        return bool(cancel_event and cancel_event.is_set())
+
+    def _ask_yes_no_cancel_from_worker(self, title, message):
+        if self._cancel_requested():
+            return None
+        completed = threading.Event()
+        answer = {"value": None}
+
+        def ask():
+            if self._cancel_requested():
+                completed.set()
+                return
+            try:
+                answer["value"] = messagebox.askyesnocancel(title, message)
+            finally:
+                completed.set()
+
+        self.root.after(0, ask)
+        completed.wait()
+        return None if self._cancel_requested() else answer["value"]
+
+    def _ask_ok_cancel_from_worker(self, title, message):
+        if self._cancel_requested():
+            return False
+        completed = threading.Event()
+        answer = {"value": False}
+
+        def ask():
+            if self._cancel_requested():
+                completed.set()
+                return
+            try:
+                answer["value"] = messagebox.askokcancel(title, message)
+            finally:
+                completed.set()
+
+        self.root.after(0, ask)
+        completed.wait()
+        return False if self._cancel_requested() else answer["value"]
+
     def log(self, message: str):
         logging.info(message)
         self.log_text.configure(state="normal")
@@ -2081,6 +2904,430 @@ class ConverterApp:
             raise ValueError(f"输出目录不可写: {exc}") from exc
         return output_dir
 
+    def _set_preflight_status(self, current, total, source_name):
+        self.progress_text_var.set(
+            f"正在检查复杂版式 [{current}/{total}] {source_name}"
+        )
+
+    def _log_from_worker(self, message):
+        self.root.after(0, self.log, message)
+
+    def _best_editable_pdf_word_method(self, preferred_method):
+        candidates = []
+        is_macos = getattr(self, "is_macos", False)
+        if preferred_method in (WORD_NATIVE, "libreoffice"):
+            candidates.append(preferred_method)
+        if not is_macos:
+            candidates.append(WORD_NATIVE)
+        candidates.append("libreoffice")
+
+        for candidate in dict.fromkeys(candidates):
+            if candidate == WORD_NATIVE and is_macos:
+                continue
+            if self._method_availability(candidate):
+                return candidate
+        return None
+
+    @staticmethod
+    def _unverifiable_table_form_reasons(report):
+        reasons = []
+        widget_count = int(getattr(report, "widget_count", 0) or 0)
+        checkbox_symbol_count = int(
+            getattr(report, "checkbox_symbol_count", 0) or 0
+        )
+        vector_mark_count = int(
+            getattr(report, "vector_mark_count", 0) or 0
+        )
+        symbol_font_count = int(getattr(report, "symbol_font_run_count", 0) or 0)
+        if widget_count:
+            reasons.append(f"PDF 表单控件 {widget_count} 个")
+        if checkbox_symbol_count:
+            reasons.append(f"复选或勾选符号 {checkbox_symbol_count} 个")
+        if vector_mark_count:
+            reasons.append(f"疑似矢量复选或勾选标记 {vector_mark_count} 处")
+        if symbol_font_count:
+            reasons.append(f"符号字体文本 {symbol_font_count} 处")
+        return reasons
+
+    @staticmethod
+    def _summarize_fidelity_reports(reports, reason_getter, limit=6):
+        lines = []
+        for report in reports[:limit]:
+            reasons = reason_getter(report)
+            detail = "；".join(reasons[:3]) if reasons else "复杂版式"
+            lines.append(f"- {report.path.name}：{detail}")
+        if len(reports) > limit:
+            lines.append(f"- 另有 {len(reports) - limit} 个文件")
+        return "\n".join(lines)
+
+    def _choose_pdf_word_fidelity_mode(self, method, paths=None):
+        """Build a per-file policy; editable table PDFs may never become images."""
+        sources = list(paths if paths is not None else self.input_paths)
+        policy = PdfWordBatchPolicy(default_method=method)
+
+        def abandon_policy():
+            policy.cleanup_snapshots()
+            return None
+
+        editable_reports = []
+        protected_text_reports = []
+        unconfirmed_table_reports = []
+        unverifiable_table_reports = []
+        image_candidate_reports = []
+        checked_files = 0
+        failed_files = 0
+
+        def add_completion_warning(source_path, message):
+            prefix = f"{source_path.name}："
+            message = str(message)
+            if message.startswith(prefix):
+                message = message[len(prefix):]
+            existing = policy.completion_warnings.get(source_path, "")
+            if existing and message not in existing:
+                policy.completion_warnings[source_path] = f"{existing}；{message}"
+            elif not existing:
+                policy.completion_warnings[source_path] = f"{prefix}{message}"
+
+        for index, source in enumerate(sources, start=1):
+            if self._cancel_requested():
+                return abandon_policy()
+            source_path = Path(source)
+            self.root.after(
+                0,
+                self._set_preflight_status,
+                index,
+                len(sources),
+                source_path.name,
+            )
+            snapshot_directory = None
+            try:
+                identity_getter = getattr(
+                    self,
+                    "_source_file_identity",
+                    _source_file_identity,
+                )
+                snapshot_copy = getattr(
+                    self,
+                    "_copy_verified_source_snapshot",
+                    _copy_verified_source_snapshot,
+                )
+                identity_before = identity_getter(source_path)
+                snapshot_directory = tempfile.TemporaryDirectory(
+                    prefix="pdf-word-converter-preflight-"
+                )
+                snapshot_path = (
+                    Path(snapshot_directory.name) / source_path.name
+                )
+                snapshot_copy(
+                    source_path,
+                    snapshot_path,
+                    identity_before,
+                )
+                report = analyze_pdf_fidelity_risk(
+                    snapshot_path,
+                    max_pages=None,
+                    cancel_requested=self._cancel_requested,
+                )
+                if isinstance(report, PdfFidelityRisk):
+                    report = replace(report, path=source_path)
+                else:
+                    # Compatible analyzer doubles may expose a mutable path
+                    # attribute without being dataclasses.
+                    report.path = source_path
+                identity_after = identity_getter(source_path)
+                if identity_before != identity_after:
+                    raise RuntimeError(
+                        "文件在版式预检期间发生变化，请重新加入后再转换"
+                    )
+                policy.source_identities[source_path] = identity_after
+                policy.source_snapshots[source_path] = snapshot_path
+                policy.snapshot_directories.append(snapshot_directory)
+                snapshot_directory = None
+            except PdfFidelityAnalysisCancelled:
+                if snapshot_directory is not None:
+                    snapshot_directory.cleanup()
+                self._log_from_worker("版式预检已取消")
+                return abandon_policy()
+            except Exception as exc:
+                if snapshot_directory is not None:
+                    snapshot_directory.cleanup()
+                failed_files += 1
+                policy.unverified_paths.add(source_path)
+                policy.image_protected_paths.add(source_path)
+                self._log_from_worker(
+                    f"版式预检跳过 {source_path.name}: {exc}"
+                )
+                policy.blocked_paths[source_path] = (
+                    "无法完成该 PDF 的可编辑内容预检；为避免把可能存在的可编辑"
+                    "表格或文字转成照片，本项已停止"
+                )
+                continue
+
+            checked_files += 1
+            table_uncertain = bool(
+                getattr(report, "table_analysis_uncertain", False)
+                or (
+                    int(getattr(report, "table_count", 0) or 0)
+                    and int(
+                        getattr(
+                            report,
+                            "table_text_extraction_failure_count",
+                            0,
+                        )
+                        or 0
+                    )
+                )
+            )
+            has_selectable_text = bool(
+                getattr(report, "has_selectable_text", False)
+                or int(getattr(report, "selectable_text_character_count", 0) or 0)
+            )
+            editable_table = bool(
+                getattr(report, "editable_table_candidate", False)
+                or table_uncertain
+            )
+            unconfirmed_table_regions = int(
+                getattr(report, "unconfirmed_table_region_count", 0) or 0
+            )
+            unconfirmed_table_layout = bool(
+                unconfirmed_table_regions
+                or (
+                    getattr(report, "table_layout_suspected", False)
+                    and not int(getattr(report, "table_count", 0) or 0)
+                )
+            )
+            if editable_table or has_selectable_text:
+                policy.image_protected_paths.add(source_path)
+
+            mapping_warning_count = int(
+                getattr(report, "unverifiable_text_character_count", 0) or 0
+            )
+            if mapping_warning_count:
+                add_completion_warning(
+                    source_path,
+                    f"{source_path.name}：检测到 {mapping_warning_count} 个无法可靠"
+                    "映射的文字字符，可能来自损坏字体编码或私用区字符。转换将继续，"
+                    "完成后请对照原 PDF 人工核对这些字符",
+                )
+
+            if bool(getattr(report, "table_analysis_limited", False)):
+                add_completion_warning(
+                    source_path,
+                    f"{source_path.name}：文档页数较多，已快速检查全部页面文字，"
+                    "但未逐页重建并严格核对所有表格；转换完成后请重点检查表格行列、"
+                    "边框和勾选状态",
+                )
+
+            if table_uncertain:
+                policy.advisory_validation_paths.add(source_path)
+                uncertain_count = int(
+                    getattr(report, "table_text_extraction_failure_count", 0) or 0
+                )
+                uncertain_label = (
+                    f"{uncertain_count} 个" if uncertain_count else "部分"
+                )
+                add_completion_warning(
+                    source_path,
+                    f"{source_path.name}：有 {uncertain_label}源表格无法"
+                    "建立完整的逐格校验基线；转换仍会继续，完成后请人工核对这些表格",
+                )
+
+            form_reasons = self._unverifiable_table_form_reasons(report)
+            if form_reasons:
+                policy.advisory_validation_paths.add(source_path)
+                add_completion_warning(
+                    source_path,
+                    f"{source_path.name}：检测到无法自动逐项验证的"
+                    + "、".join(form_reasons)
+                    + "；转换仍会继续，完成后请重点核对对应符号和勾选状态",
+                )
+
+            if has_selectable_text:
+                policy.selectable_text_reports[source_path] = report
+
+            if unconfirmed_table_layout:
+                unconfirmed_table_reports.append(report)
+                policy.advisory_validation_paths.add(source_path)
+                add_completion_warning(
+                    source_path,
+                    f"{source_path.name}：发现 {unconfirmed_table_regions or '若干'} 处"
+                    "疑似表格区域，但无法建立可靠的逐格校验基线；已优先继续转换，"
+                    "完成后请对照原 PDF 仔细检查",
+                )
+
+            if editable_table:
+                if form_reasons:
+                    unverifiable_table_reports.append(report)
+                editable_reports.append(report)
+                policy.editable_table_reports[source_path] = report
+                editable_method = self._best_editable_pdf_word_method(method)
+                if editable_method is None:
+                    policy.blocked_paths[source_path] = (
+                        "检测到可编辑表格或表格结构无法完全验证，但当前没有可用的 Word 或 "
+                        "LibreOffice 可编辑转换引擎；为避免生成照片，本项未转换"
+                    )
+                else:
+                    policy.method_overrides[source_path] = editable_method
+            elif has_selectable_text:
+                protected_text_reports.append(report)
+                editable_method = self._best_editable_pdf_word_method(method)
+                if editable_method is None:
+                    policy.blocked_paths[source_path] = (
+                        "检测到可选择文字，但当前没有可用的 Word 或 LibreOffice "
+                        "可编辑转换引擎；为避免遗漏表格并生成照片，本项未转换"
+                    )
+                else:
+                    policy.method_overrides[source_path] = editable_method
+            elif report.is_complex:
+                image_candidate_reports.append(report)
+
+        if self._cancel_requested():
+            return abandon_policy()
+
+        if editable_reports:
+            table_text_count = sum(
+                int(getattr(report, "table_text_character_count", 0) or 0)
+                for report in editable_reports
+            )
+            detail = f"；另有 {failed_files} 个无法检查" if failed_files else ""
+            self._log_from_worker(
+                f"检测到 {len(editable_reports)} 个含可选择文字的表格 PDF"
+                f"（表格文字共 {table_text_count} 字符），已锁定可编辑转换并启用"
+                f"输出表格结构校验{detail}"
+            )
+
+        if protected_text_reports:
+            self._log_from_worker(
+                f"检测到 {len(protected_text_reports)} 个含可选择文字但未确认表格的 PDF，"
+                "已禁止整页图片转换和图片回退"
+            )
+
+        if unconfirmed_table_reports:
+            self._log_from_worker(
+                f"检测到 {len(unconfirmed_table_reports)} 个版面疑似表格但无法提取"
+                "可验证结构的 PDF，已继续使用可编辑引擎并将在完成后提醒人工核对"
+            )
+
+        if unverifiable_table_reports:
+            details = self._summarize_fidelity_reports(
+                unverifiable_table_reports,
+                self._unverifiable_table_form_reasons,
+            )
+            self._log_from_worker(
+                "检测到无法可靠验证勾选状态或符号字体的可编辑表格，"
+                f"已继续转换并将在完成后提醒人工核对：{details}"
+            )
+
+        forced_non_image_reports = [
+            report
+            for report in editable_reports + protected_text_reports
+            if policy.method_overrides.get(Path(report.path)) not in (None, method)
+        ]
+        if forced_non_image_reports:
+            if self._cancel_requested():
+                return abandon_policy()
+            details = self._summarize_fidelity_reports(
+                forced_non_image_reports,
+                lambda report: [
+                    f"可选择文字 {getattr(report, 'selectable_text_character_count', 0)} 字符",
+                    f"表格结构 {getattr(report, 'table_count', 0)} 个",
+                    f"表格文字 {getattr(report, 'table_text_character_count', 0)} 字符",
+                    f"将使用 {policy.method_overrides[Path(report.path)]}",
+                ],
+            )
+            use_editable = self._ask_ok_cancel_from_worker(
+                "可选择文字不能使用图片模式",
+                "你选择了整页图片模式，但以下 PDF 含可选择文字，可能包含可编辑表格：\n"
+                f"{details}\n\n"
+                "为保证文字和可能存在的表格可编辑，程序将只对这些文件改用可编辑引擎；"
+                "其他文件仍按图片模式转换。\n\n"
+                "选择“确定”继续；选择“取消”停止本批。",
+            )
+            if not use_editable:
+                self._log_from_worker("用户取消了图片模式中的可编辑内容转换")
+                return abandon_policy()
+
+        blocked_count = len(policy.blocked_paths)
+        if blocked_count:
+            blocked_names = "\n".join(
+                f"- {path.name}" for path in list(policy.blocked_paths)[:6]
+            )
+            if blocked_count > 6:
+                blocked_names += f"\n- 另有 {blocked_count - 6} 个文件"
+            if self._cancel_requested():
+                return abandon_policy()
+            continue_batch = self._ask_ok_cancel_from_worker(
+                "部分文件无法保证可编辑内容",
+                f"以下 {blocked_count} 个文件没有可用的安全转换路径：\n"
+                f"{blocked_names}\n\n"
+                "这些文件会标记为失败且不会生成照片；批次中的其他文件仍可继续。\n\n"
+                "选择“确定”继续；选择“取消”停止本批。",
+            )
+            if not continue_batch:
+                self._log_from_worker("用户取消了缺少可编辑引擎的转换")
+                return abandon_policy()
+
+        if method != "images" and image_candidate_reports:
+            if self._cancel_requested():
+                return abandon_policy()
+            details = self._summarize_fidelity_reports(
+                image_candidate_reports,
+                lambda report: list(getattr(report, "reasons", ())),
+            )
+            if not self._method_availability("images"):
+                continue_editable = self._ask_ok_cancel_from_worker(
+                    "检测到扫描或纯图形复杂版式",
+                    f"以下文件没有可选择文字，但存在复杂图形：\n{details}\n\n"
+                    "当前内置图片组件不可用，只能继续可编辑模式，版式可能变化。\n\n"
+                    "选择“确定”继续；选择“取消”停止本批。",
+                )
+                if not continue_editable:
+                    self._log_from_worker("用户取消了复杂版式转换")
+                    return abandon_policy()
+            else:
+                choice = self._ask_yes_no_cancel_from_worker(
+                    "检测到扫描或纯图形复杂版式",
+                    f"以下文件没有可选择文字，但存在复杂图形：\n{details}\n\n"
+                    "选择“是”：仅这些文件改用整页高清图片；\n"
+                    "选择“否”：这些文件也继续可编辑模式；\n"
+                    "选择“取消”：停止本批。\n\n"
+                    "同批中的可编辑表格文件不会受到影响，也不会被改成图片。",
+                )
+                if choice is None:
+                    self._log_from_worker("用户取消了复杂版式转换")
+                    return abandon_policy()
+                if choice:
+                    for report in image_candidate_reports:
+                        policy.method_overrides[Path(report.path)] = "images"
+                    self._log_from_worker(
+                        f"仅将 {len(image_candidate_reports)} 个非表格复杂 PDF "
+                        "切换为整页图片模式"
+                    )
+                else:
+                    self._log_from_worker(
+                        f"{len(image_candidate_reports)} 个非表格复杂 PDF "
+                        "继续使用可编辑模式"
+                    )
+        elif (
+            not editable_reports
+            and not protected_text_reports
+            and not unconfirmed_table_reports
+            and not image_candidate_reports
+        ):
+            if checked_files:
+                detail = f"，另有 {failed_files} 个无法检查" if failed_files else ""
+                self._log_from_worker(
+                    f"版式预检完成：成功检查 {checked_files} 个 PDF，"
+                    f"未发现高风险结构{detail}"
+                )
+            elif failed_files:
+                self._log_from_worker(
+                    f"版式预检未完成：{failed_files} 个 PDF 均无法检查，"
+                    "已按安全规则标记失败"
+                )
+
+        return policy
+
     def start_conversion(self):
         if not self.input_paths:
             messagebox.showwarning("提示", "请先添加文件")
@@ -2108,7 +3355,9 @@ class ConverterApp:
             if self.is_macos and method == WORD_NATIVE:
                 messagebox.showerror(
                     "此平台不支持",
-                    "macOS 首版尚未开放 Word 原生 PDF → DOCX，请改用图片模式或 LibreOffice。",
+                    "macOS 源码预览尚未开放 Word 原生 PDF → DOCX。含可选择文字或表格的 "
+                    "PDF 请使用 LibreOffice；只有完全没有可选择文字的扫描件或纯图形 "
+                    "PDF 才能使用图片模式。",
                 )
                 return
         elif spec.key == "pdf_to_powerpoint":
@@ -2160,6 +3409,7 @@ class ConverterApp:
             return
 
         self.output_paths = []
+        self._stop_cancel_wait_timer()
         self._cancel_event.clear()
         self._reset_queue_status()
         self._set_busy(True)
@@ -2170,10 +3420,22 @@ class ConverterApp:
 
         paths = list(self.input_paths)
         threading.Thread(
-            target=self._run_batch,
+            target=self._prepare_and_run_batch,
             args=(paths, spec, output_dir, method),
             daemon=True,
         ).start()
+
+    def _prepare_and_run_batch(self, paths, spec, output_dir, method):
+        policy = None
+        try:
+            if spec.key == "pdf_to_word":
+                policy = self._choose_pdf_word_fidelity_mode(method, paths)
+                if policy is None:
+                    self._cancel_event.set()
+        except Exception as exc:
+            self.root.after(0, self._on_batch_error, str(exc))
+            return
+        self._run_batch(paths, spec, output_dir, method, policy)
 
     def _reset_queue_status(self):
         for item_id in self.file_tree.get_children():
@@ -2182,8 +3444,517 @@ class ConverterApp:
             values[3] = ""
             self.file_tree.item(item_id, values=values, tags=())
 
-    def _run_batch(self, paths, spec, output_dir, method):
-        converter = self._create_converter(spec, method)
+    @staticmethod
+    def _validate_selectable_text_output(output, report, progress):
+        summary = inspect_editable_docx_tables(output)
+        source_text = getattr(report, "selectable_text", None)
+        output_text = getattr(summary, "visible_text", None)
+        source_count = int(
+            getattr(report, "selectable_text_character_count", 0) or 0
+        )
+        output_count = int(
+            getattr(summary, "visible_text_character_count", 0) or 0
+        )
+        mapping_warning_count = int(
+            getattr(report, "unverifiable_text_character_count", 0) or 0
+        )
+        if mapping_warning_count:
+            progress(
+                f"检测到 {mapping_warning_count} 个字体映射可疑字符，"
+                "已保留结果并将在完成时提醒人工核对",
+                99,
+            )
+            return
+        if not _document_text_evidence_matches(
+            source_text,
+            output_text,
+            source_character_count=source_count,
+            output_character_count=output_count,
+        ):
+            raise RuntimeError(
+                "Word 输出未通过全文文字校验：可见文字 "
+                f"{output_count}/{source_count} 个非空字符。"
+                "为避免交付漏字、错字或额外文字的文件，结果已拒绝"
+            )
+        progress(f"已确认全文可见文字：{output_count} 个非空字符", 99)
+
+    @staticmethod
+    def _validate_editable_table_output(output, report, progress):
+        summary = inspect_editable_docx_tables(output)
+        source_text_count = int(
+            getattr(report, "table_text_character_count", 0) or 0
+        )
+        source_table_count = max(
+            1,
+            int(getattr(report, "table_count", 0) or 0),
+        )
+        minimum_text_count = source_text_count
+        source_table_texts = tuple(
+            getattr(report, "table_texts", ()) or ()
+        )
+        source_table_cell_matrices = tuple(
+            getattr(report, "table_cell_matrices", ()) or ()
+        )
+        source_table_shapes = tuple(
+            getattr(report, "table_shapes", ()) or ()
+        )
+        source_table_full_width_span_rows = tuple(
+            getattr(report, "table_full_width_span_rows", ()) or ()
+        )
+        if not source_table_full_width_span_rows:
+            source_table_full_width_span_rows = tuple(
+                (False,) * int(shape[0])
+                for shape in source_table_shapes
+                if _coerce_table_shape(shape) is not None
+            )
+        source_table_cell_counts = tuple(
+            getattr(report, "table_cell_counts", ()) or ()
+        )
+        source_table_cell_spans = tuple(
+            getattr(report, "table_cell_spans", ()) or ()
+        )
+        source_table_cell_border_edges = tuple(
+            getattr(report, "table_cell_border_edges", ()) or ()
+        )
+        output_table_texts = tuple(
+            getattr(summary, "table_texts", ()) or ()
+        )
+        output_table_cell_matrices = tuple(
+            getattr(summary, "table_cell_matrices", ()) or ()
+        )
+        output_table_shapes = tuple(
+            getattr(summary, "table_shapes", ()) or ()
+        )
+        output_table_cell_counts = tuple(
+            getattr(summary, "table_cell_counts", ()) or ()
+        )
+        output_table_cell_spans = tuple(
+            getattr(summary, "table_cell_spans", ()) or ()
+        )
+        output_table_cell_border_edges = tuple(
+            getattr(summary, "table_cell_border_edges", ()) or ()
+        )
+        source_document_text = getattr(report, "selectable_text", None)
+        output_document_text = getattr(summary, "visible_text", None)
+        source_document_text_count = int(
+            getattr(report, "selectable_text_character_count", 0) or 0
+        )
+        output_document_text_count = int(
+            getattr(summary, "visible_text_character_count", 0) or 0
+        )
+        mapping_warning_count = int(
+            getattr(report, "unverifiable_text_character_count", 0) or 0
+        )
+        document_text_evidence_valid = (
+            True
+            if source_document_text is None or mapping_warning_count
+            else _document_text_evidence_matches(
+                source_document_text,
+                output_document_text,
+                source_character_count=source_document_text_count,
+                output_character_count=output_document_text_count,
+            )
+        )
+        source_table_border_maps = tuple(
+            _coerce_table_cell_border_map(edges, spans, shape)
+            for edges, spans, shape in zip(
+                source_table_cell_border_edges,
+                source_table_cell_spans,
+                source_table_shapes,
+            )
+        )
+        output_table_border_maps = tuple(
+            _coerce_table_cell_border_map(edges, spans, shape)
+            for edges, spans, shape in zip(
+                output_table_cell_border_edges,
+                output_table_cell_spans,
+                output_table_shapes,
+            )
+        )
+        border_evidence_valid = (
+            len(source_table_cell_border_edges) == source_table_count
+            and len(output_table_cell_border_edges) == summary.table_count
+            and len(source_table_border_maps) == source_table_count
+            and len(output_table_border_maps) == summary.table_count
+            and all(border_map is not None for border_map in source_table_border_maps)
+            and all(border_map is not None for border_map in output_table_border_maps)
+            and source_table_border_maps == output_table_border_maps
+        )
+        source_structure_complete = (
+            len(source_table_texts) == source_table_count
+            and len(source_table_cell_matrices) == source_table_count
+            and len(source_table_shapes) == source_table_count
+            and len(source_table_full_width_span_rows) == source_table_count
+            and len(source_table_cell_counts) == source_table_count
+            and len(source_table_cell_spans) == source_table_count
+            and len(source_table_cell_border_edges) == source_table_count
+            and len(source_table_border_maps) == source_table_count
+            and all(border_map is not None for border_map in source_table_border_maps)
+            and all(
+                _coerce_table_cell_spans(spans, shape) is not None
+                and len(spans) == int(cell_count)
+                for spans, shape, cell_count in zip(
+                    source_table_cell_spans,
+                    source_table_shapes,
+                    source_table_cell_counts,
+                )
+            )
+            and all(
+                len(table_rows) == int(shape[0])
+                for table_rows, shape in zip(
+                    source_table_full_width_span_rows,
+                    source_table_shapes,
+                )
+            )
+            and all(
+                _table_cell_matrix_matches_text(matrix, shape, text)
+                for matrix, shape, text in zip(
+                    source_table_cell_matrices,
+                    source_table_shapes,
+                    source_table_texts,
+                )
+            )
+        )
+        output_structure_complete = (
+            len(output_table_texts) == summary.table_count
+            and len(output_table_cell_matrices) == summary.table_count
+            and len(output_table_shapes) == summary.table_count
+            and len(output_table_cell_counts) == summary.table_count
+            and len(output_table_cell_spans) == summary.table_count
+            and len(output_table_cell_border_edges) == summary.table_count
+            and len(output_table_border_maps) == summary.table_count
+            and all(border_map is not None for border_map in output_table_border_maps)
+            and all(
+                _coerce_table_cell_spans(spans, shape) is not None
+                and len(spans) == int(cell_count)
+                for spans, shape, cell_count in zip(
+                    output_table_cell_spans,
+                    output_table_shapes,
+                    output_table_cell_counts,
+                )
+            )
+            and all(
+                _table_cell_matrix_matches_text(matrix, shape, text)
+                for matrix, shape, text in zip(
+                    output_table_cell_matrices,
+                    output_table_shapes,
+                    output_table_texts,
+                )
+            )
+        )
+        table_content_valid, matched_table_count, compared_table_count = (
+            _table_structures_preserved(
+                source_table_texts,
+                source_table_shapes,
+                source_table_cell_counts,
+                output_table_texts,
+                output_table_shapes,
+                output_table_cell_counts,
+                source_cell_matrices=source_table_cell_matrices,
+                output_cell_matrices=output_table_cell_matrices,
+                source_full_width_span_rows=(
+                    source_table_full_width_span_rows
+                ),
+                source_cell_spans=source_table_cell_spans,
+                output_cell_spans=output_table_cell_spans,
+            )
+        )
+        source_shape_text = "、".join(
+            f"{shape[0]}×{shape[1]}/{cell_count} 格"
+            for shape, cell_count in zip(
+                source_table_shapes,
+                source_table_cell_counts,
+            )
+        ) or "缺失"
+        output_shape_text = "、".join(
+            f"{shape[0]}×{shape[1]}/{cell_count} 格"
+            for shape, cell_count in zip(
+                output_table_shapes,
+                output_table_cell_counts,
+            )
+        ) or "缺失"
+        has_editable_structure = bool(
+            getattr(
+                summary,
+                "has_editable_table_structure",
+                summary.has_editable_table,
+            )
+        )
+        has_required_editable_table = (
+            bool(summary.has_editable_table)
+            if minimum_text_count
+            else has_editable_structure
+        )
+        large_page_drawing_count = int(
+            getattr(summary, "large_page_drawing_count", 0) or 0
+        )
+        if (
+            not has_required_editable_table
+            or summary.table_count != source_table_count
+            or summary.table_text_character_count != minimum_text_count
+            or large_page_drawing_count
+            or not source_structure_complete
+            or not output_structure_complete
+            or not table_content_valid
+            or not border_evidence_valid
+            or not document_text_evidence_valid
+        ):
+            protection_details = []
+            if not document_text_evidence_valid:
+                protection_details.append(
+                    "整份文档的可见文字与源 PDF 不一致"
+                )
+            if not border_evidence_valid:
+                protection_details.append("单元格边框与源 PDF 不一致")
+            if summary.document_protected:
+                protection_details.append("文档被限制编辑")
+            locked_tables = int(
+                getattr(summary, "locked_content_control_table_count", 0) or 0
+            )
+            if locked_tables:
+                protection_details.append(f"{locked_tables} 个表格被内容控件锁定")
+            if large_page_drawing_count:
+                protection_details.append(
+                    f"检测到 {large_page_drawing_count} 张大面积页面图片"
+                )
+            invalid_layout_tables = int(
+                getattr(summary, "invalid_layout_table_count", 0) or 0
+            )
+            if invalid_layout_tables:
+                protection_details.append(
+                    f"{invalid_layout_tables} 个表格无法证明在页面中清晰可见"
+                )
+            protection_detail = (
+                "，且" + "、".join(protection_details)
+                if protection_details
+                else ""
+            )
+            raise RuntimeError(
+                "源 PDF 含可编辑表格结构，但输出未通过可编辑表格校验："
+                f"Word 表格 {summary.table_count}/{source_table_count} 个、"
+                f"行 {summary.row_count} 个、"
+                f"单元格 {summary.cell_count} 个、表格文字 "
+                f"{summary.table_text_character_count}/{minimum_text_count} 字符、"
+                f"逐表、逐行和逐格内容与结构 {matched_table_count}/{compared_table_count} 个"
+                f"（源 {source_shape_text}；输出 {output_shape_text}）、"
+                f"全文可见文字 {output_document_text_count}/"
+                f"{source_document_text_count} 个非空字符"
+                f"{protection_detail}。为避免交付照片、伪表格或漏字结果，结果已拒绝"
+            )
+        progress(
+            f"已确认可编辑 Word 表格：{summary.table_count} 个表格，"
+            f"{summary.table_text_character_count} 个表格文字字符，"
+            f"全文 {output_document_text_count} 个非空字符",
+            99,
+        )
+
+    def _run_batch(self, paths, spec, output_dir, method, policy=None):
+        completion_warnings = {}
+        if spec.key != "pdf_to_word":
+            converter = self._create_converter(spec, method)
+        else:
+            if policy is None:
+                if self._cancel_requested():
+                    policy = PdfWordBatchPolicy(default_method=method)
+                else:
+                    self.root.after(
+                        0,
+                        self._on_batch_error,
+                        "PDF → Word 缺少版式预检结果，已阻止转换",
+                    )
+                    return
+            method_overrides = {
+                self._path_key(path): item_method
+                for path, item_method in policy.method_overrides.items()
+            }
+            editable_reports = {
+                self._path_key(path): report
+                for path, report in policy.editable_table_reports.items()
+            }
+            selectable_text_reports = {
+                self._path_key(path): report
+                for path, report in policy.selectable_text_reports.items()
+            }
+            blocked_paths = {
+                self._path_key(path): message
+                for path, message in policy.blocked_paths.items()
+            }
+            unverified_paths = {
+                self._path_key(path) for path in policy.unverified_paths
+            }
+            image_protected_paths = {
+                self._path_key(path) for path in policy.image_protected_paths
+            }
+            source_identities = {
+                self._path_key(path): identity
+                for path, identity in policy.source_identities.items()
+            }
+            source_snapshots = {
+                self._path_key(path): Path(snapshot)
+                for path, snapshot in policy.source_snapshots.items()
+            }
+            completion_warnings = {
+                self._path_key(path): message
+                for path, message in policy.completion_warnings.items()
+            }
+            advisory_validation_paths = {
+                self._path_key(path) for path in policy.advisory_validation_paths
+            }
+            converter_cache = {}
+
+            def converter(source, output, progress):
+                source_path = Path(source)
+                source_key = self._path_key(source_path)
+                blocked_message = blocked_paths.get(source_key)
+                if blocked_message:
+                    raise RuntimeError(blocked_message)
+
+                expected_identity = source_identities.get(source_key)
+                if expected_identity is None:
+                    raise RuntimeError(
+                        "PDF 缺少与版式预检绑定的源文件身份，本项已停止，"
+                        "请重新加入文件后再转换"
+                    )
+                identity_getter = getattr(
+                    self,
+                    "_source_file_identity",
+                    _source_file_identity,
+                )
+                if identity_getter(source_path) != expected_identity:
+                    raise RuntimeError(
+                        "源 PDF 在版式预检后发生变化；为避免沿用旧判断，本项已停止，"
+                        "请重新加入文件后再转换"
+                    )
+
+                item_method = method_overrides.get(
+                    source_key,
+                    policy.default_method,
+                )
+                report = editable_reports.get(source_key)
+                selectable_text_report = selectable_text_reports.get(source_key)
+                prevent_image_fallback = (
+                    report is not None
+                    or source_key in unverified_paths
+                    or source_key in image_protected_paths
+                )
+                if item_method == "images" and prevent_image_fallback:
+                    raise RuntimeError(
+                        "该 PDF 含可选择文字或可能含可编辑表格，已阻止整页图片转换"
+                    )
+
+                cache_key = (item_method, prevent_image_fallback)
+                item_converter = converter_cache.get(cache_key)
+                if item_converter is None:
+                    item_converter = self._create_converter(
+                        spec,
+                        item_method,
+                        allow_image_fallback=not prevent_image_fallback,
+                    )
+                    converter_cache[cache_key] = item_converter
+
+                snapshot_path = source_snapshots.get(source_key)
+                if snapshot_path is None or not snapshot_path.is_file():
+                    raise RuntimeError(
+                        "PDF 预检快照不存在，本项已停止，请重新加入文件后再转换"
+                    )
+                if self._path_key(snapshot_path) == source_key:
+                    raise RuntimeError("PDF 预检快照不能与原始文件使用同一路径")
+                if _source_file_identity(snapshot_path)[4] != expected_identity[4]:
+                    raise RuntimeError("PDF 预检快照与源文件身份不一致")
+                engine_progress = progress
+                if report is not None or selectable_text_report is not None:
+                    def engine_progress(message, pct):
+                        bounded_pct = max(0, min(100, int(pct)))
+                        progress(message, min(96, int(bounded_pct * 0.96)))
+                item_converter(str(snapshot_path), output, engine_progress)
+                if identity_getter(source_path) != expected_identity:
+                    raise RuntimeError(
+                        "源 PDF 在转换期间发生变化；本项已停止，"
+                        "请重新加入文件后再转换"
+                    )
+                if _source_file_identity(snapshot_path)[4] != expected_identity[4]:
+                    raise RuntimeError("转换引擎意外修改了受保护的源 PDF 快照")
+                if report is not None:
+                    progress("正在校正可编辑 Word 表格结构...", 97)
+                    mapping_warning_count = int(
+                        getattr(
+                            report,
+                            "unverifiable_text_character_count",
+                            0,
+                        )
+                        or 0
+                    )
+                    advisory_validation = bool(
+                        mapping_warning_count
+                        or source_key in advisory_validation_paths
+                    )
+                    if advisory_validation:
+                        # An advisory result must still be a readable DOCX.
+                        inspect_editable_docx_tables(output)
+                    try:
+                        repaired = repair_docx_table_topology(
+                            output,
+                            table_shapes=report.table_shapes,
+                            table_cell_matrices=report.table_cell_matrices,
+                            table_cell_spans=report.table_cell_spans,
+                            table_cell_border_edges=report.table_cell_border_edges,
+                            table_column_widths=report.table_column_widths,
+                        )
+                        if repaired:
+                            progress("已安全恢复 Word 表格的行列与合并关系", 98)
+                        self._validate_editable_table_output(
+                            output,
+                            report,
+                            progress,
+                        )
+                    except Exception as exc:
+                        if not advisory_validation:
+                            if isinstance(exc, DocxTableRepairError):
+                                raise RuntimeError(
+                                    "源 PDF 含可编辑表格，但 Word 输出无法在不猜测的情况下"
+                                    f"恢复原始单元格结构：{exc}"
+                                ) from exc
+                            raise
+                        original_warning = completion_warnings.get(source_key, "")
+                        validation_warning = (
+                            "可编辑表格的严格文字或结构校验未完全通过："
+                            f"{exc}。已按你的设置保留可打开的转换结果，请重点人工核对"
+                        )
+                        completion_warnings[source_key] = (
+                            f"{original_warning}；{validation_warning}"
+                            if original_warning
+                            else f"{source_path.name}：{validation_warning}"
+                        )
+                        progress(
+                            "部分结构无法严格验证；"
+                            "已保留结果并将在完成时提醒",
+                            99,
+                        )
+                elif selectable_text_report is not None:
+                    progress("正在校验 Word 全文可见文字...", 97)
+                    try:
+                        self._validate_selectable_text_output(
+                            output,
+                            selectable_text_report,
+                            progress,
+                        )
+                    except Exception as exc:
+                        if source_key not in advisory_validation_paths:
+                            raise
+                        original_warning = completion_warnings.get(source_key, "")
+                        validation_warning = (
+                            "全文文字严格校验未完全通过："
+                            f"{exc}。已保留可打开的转换结果，请对照原 PDF 仔细检查"
+                        )
+                        completion_warnings[source_key] = (
+                            f"{original_warning}；{validation_warning}"
+                            if original_warning
+                            else f"{source_path.name}：{validation_warning}"
+                        )
+                        progress(
+                            "全文文字无法完全一致；已保留结果并将在完成时提醒",
+                            99,
+                        )
         try:
             results = run_conversion_batch(
                 paths,
@@ -2194,9 +3965,27 @@ class ConverterApp:
                 self._progress_update,
                 self._status_update,
             )
-            self.root.after(0, self._on_batch_complete, results)
+            successful_keys = {
+                self._path_key(result.source)
+                for result in results
+                if result.status == "success"
+            }
+            warning_messages = [
+                message
+                for path_key, message in completion_warnings.items()
+                if path_key in successful_keys
+            ]
+            self.root.after(
+                0,
+                self._on_batch_complete,
+                results,
+                warning_messages,
+            )
         except Exception as exc:
             self.root.after(0, self._on_batch_error, str(exc))
+        finally:
+            if policy is not None:
+                policy.cleanup_snapshots()
 
     def _record_native_status(self, key, status):
         self._set_engine_status(key, status)
@@ -2242,19 +4031,14 @@ class ConverterApp:
                     f"LibreOffice 回退也失败：{fallback_error}"
                 ) from fallback_error
 
-    def _create_converter(self, spec, method):
+    def _create_converter(self, spec, method, allow_image_fallback=True):
         if spec.key == "pdf_to_word":
             def convert_pdf(source, output, progress):
                 if method == WORD_NATIVE and not self.is_macos:
-                    pdf_to_word_via_word(
-                        source, output,
-                        lambda message, pct: progress(message, min(88, int(pct * 0.88))),
-                    )
-                    fix_converted_docx(
-                        output,
-                        lambda message, pct: progress(message, min(99, max(89, pct))),
-                    )
+                    progress("使用 Microsoft Word 可编辑模式...", 1)
+                    pdf_to_word_via_word(source, output, progress)
                 elif method == "images":
+                    progress("使用外观优先的整页高清图片模式...", 1)
                     pdf_to_word_via_images(source, output, progress)
                 elif method == "libreoffice":
                     try:
@@ -2263,6 +4047,11 @@ class ConverterApp:
                             lambda message, pct: progress(message, min(88, int(pct * 0.88))),
                         )
                     except Exception as exc:
+                        if not allow_image_fallback:
+                            raise RuntimeError(
+                                "可编辑表格保护已启用，LibreOffice 转换失败后未回退到"
+                                f"整页图片：{exc}"
+                            ) from exc
                         can_retry = pymupdf_available() and is_libreoffice_export_filter_error(exc)
                         if not can_retry or not self._ask_yes_no_from_worker(
                             "LibreOffice 转换失败",
@@ -2276,10 +4065,6 @@ class ConverterApp:
                         progress("改用内置图片模式重试...", 5)
                         pdf_to_word_via_images(source, output, progress)
                         return
-                    fix_converted_docx(
-                        output,
-                        lambda message, pct: progress(message, min(99, max(89, pct))),
-                    )
                 else:
                     raise RuntimeError(f"未知转换方式: {method}")
 
@@ -2427,15 +4212,59 @@ class ConverterApp:
         elif result.status == "cancelled":
             self.log(f"{prefix} 已取消: {result.source.name}")
 
+    def _stop_cancel_wait_timer(self):
+        after_id = getattr(self, "_cancel_wait_after_id", None)
+        if after_id is not None:
+            after_cancel = getattr(self.root, "after_cancel", None)
+            if callable(after_cancel):
+                try:
+                    after_cancel(after_id)
+                except (RuntimeError, tk.TclError):
+                    pass
+        self._cancel_wait_after_id = None
+        self._cancel_wait_started_at = None
+
+    def _cancel_wait_message(self, elapsed_seconds):
+        if getattr(self, "_close_after_batch", False):
+            action = "当前文件结束后安全退出"
+        else:
+            action = "当前文件处理结束后取消"
+        return f"正在等待{action}...（已等待 {elapsed_seconds} 秒）"
+
+    def _cancel_wait_tick(self):
+        self._cancel_wait_after_id = None
+        if not self._is_converting or not self._cancel_requested():
+            self._stop_cancel_wait_timer()
+            return
+        started_at = getattr(self, "_cancel_wait_started_at", None)
+        if started_at is None:
+            return
+        elapsed_seconds = max(0, int(time.monotonic() - started_at))
+        self.progress_text_var.set(self._cancel_wait_message(elapsed_seconds))
+        self._cancel_wait_after_id = self.root.after(
+            1000,
+            self._cancel_wait_tick,
+        )
+
+    def _start_cancel_wait_timer(self):
+        self._stop_cancel_wait_timer()
+        self._cancel_wait_started_at = time.monotonic()
+        self.progress_text_var.set(self._cancel_wait_message(0))
+        self._cancel_wait_after_id = self.root.after(
+            1000,
+            self._cancel_wait_tick,
+        )
+
     def cancel_conversion(self):
         if not self._is_converting or self._cancel_event.is_set():
             return
         self._cancel_event.set()
         self.cancel_btn.config(state="disabled")
-        self.progress_text_var.set("正在等待当前文件处理结束后取消...")
+        self._start_cancel_wait_timer()
         self.log("已请求取消；当前文件结束后将停止后续任务")
 
-    def _on_batch_complete(self, results):
+    def _on_batch_complete(self, results, warnings=None):
+        self._stop_cancel_wait_timer()
         self._set_busy(False)
         successful = [result for result in results if result.status == "success"]
         failed = [result for result in results if result.status == "failed"]
@@ -2461,8 +4290,24 @@ class ConverterApp:
             if len(failed) > len(shown):
                 details += f"\n- 另有 {len(failed) - len(shown)} 个失败，请查看日志"
 
+        warnings = tuple(warnings or ())
+        if warnings:
+            shown_warnings = warnings[:5]
+            details += "\n\n转换质量提醒:\n" + "\n".join(
+                f"- {warning}" for warning in shown_warnings
+            )
+            if len(warnings) > len(shown_warnings):
+                details += (
+                    f"\n- 另有 {len(warnings) - len(shown_warnings)} 个提醒，"
+                    "请查看日志"
+                )
+            for warning in warnings:
+                self.log(f"转换质量提醒: {warning}")
+
         message = summary + details
-        if len(successful) == len(results):
+        if warnings:
+            messagebox.showwarning("转换完成，请仔细核对", message)
+        elif len(successful) == len(results):
             messagebox.showinfo("转换完成", message)
         elif not successful and failed and not cancelled:
             messagebox.showerror("转换失败", message)
@@ -2470,6 +4315,7 @@ class ConverterApp:
             messagebox.showwarning("批次已结束", message)
 
     def _on_batch_error(self, error):
+        self._stop_cancel_wait_timer()
         self._set_busy(False)
         self.progress_text_var.set("批次异常终止")
         self.log(f"批次异常终止: {error}")
@@ -2489,7 +4335,6 @@ class ConverterApp:
                 return
             self._close_after_batch = True
             self.cancel_conversion()
-            self.progress_text_var.set("正在等待当前文件结束后安全退出...")
             self.log("窗口将在当前文件结束后关闭")
             return
         self.root.destroy()

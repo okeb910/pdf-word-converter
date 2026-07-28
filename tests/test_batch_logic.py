@@ -3,8 +3,14 @@ import threading
 import unittest
 import unicodedata
 from pathlib import Path
+from unittest.mock import patch
 
-from batch_logic import deduplicate_paths, resolve_output_path, run_conversion_batch
+from batch_logic import (
+    _cleanup_failed_output,
+    deduplicate_paths,
+    resolve_output_path,
+    run_conversion_batch,
+)
 
 
 class OutputPathTests(unittest.TestCase):
@@ -133,8 +139,132 @@ class BatchRunnerTests(unittest.TestCase):
 
             self.assertEqual([result.status for result in results], ["failed", "success"])
             self.assertIn("模拟失败", results[0].error)
+            self.assertIsNone(results[0].output)
             self.assertFalse((folder / "bad.docx").exists())
             self.assertTrue((folder / "good.docx").exists())
+
+    def test_cleanup_failed_output_deletes_rejected_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "rejected.docx"
+            output.write_bytes(b"partial")
+
+            message = _cleanup_failed_output(output, retry_delay=0)
+
+            self.assertEqual(message, "")
+            self.assertFalse(output.exists())
+
+    def test_cleanup_failed_output_quarantines_locked_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "rejected.docx"
+            output.write_bytes(b"partial")
+
+            with patch.object(
+                Path,
+                "unlink",
+                side_effect=PermissionError("locked"),
+            ):
+                message = _cleanup_failed_output(
+                    output,
+                    attempts=1,
+                    retry_delay=0,
+                )
+
+            quarantine = Path(str(output) + ".failed")
+            self.assertIn("已隔离", message)
+            self.assertFalse(output.exists())
+            self.assertTrue(quarantine.exists())
+
+    def test_cleanup_failed_output_reports_unremovable_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "rejected.docx"
+            output.write_bytes(b"partial")
+
+            with patch.object(
+                Path,
+                "unlink",
+                side_effect=PermissionError("locked"),
+            ), patch.object(
+                Path,
+                "rename",
+                side_effect=PermissionError("still locked"),
+            ):
+                message = _cleanup_failed_output(
+                    output,
+                    attempts=1,
+                    retry_delay=0,
+                )
+
+            self.assertIn("清理失败", message)
+            self.assertIn(str(output), message)
+            self.assertTrue(output.exists())
+
+    def test_batch_failure_appends_cleanup_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            source = self._make_sources(folder, ["bad.pdf"])[0]
+
+            def converter(_source, output, _progress):
+                Path(output).write_bytes(b"partial")
+                raise RuntimeError("conversion rejected")
+
+            with patch(
+                "batch_logic._cleanup_failed_output",
+                return_value="不完整输出仍被占用",
+            ):
+                results = run_conversion_batch(
+                    [source],
+                    ".docx",
+                    None,
+                    converter,
+                    threading.Event(),
+                    lambda *_args: None,
+                    lambda _result: None,
+                )
+
+            self.assertEqual(results[0].status, "failed")
+            self.assertIsNone(results[0].output)
+            self.assertIn("conversion rejected", results[0].error)
+            self.assertIn("不完整输出仍被占用", results[0].error)
+
+    def test_cleanup_failure_never_exposes_formal_output_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            source = self._make_sources(folder, ["rejected.pdf"])[0]
+            cleanup_targets = []
+
+            def converter(_source, output, _progress):
+                Path(output).write_bytes(b"invalid docx")
+                raise RuntimeError("editable-table gate rejected output")
+
+            def fail_cleanup(output, *args, **kwargs):
+                del args, kwargs
+                cleanup_targets.append(Path(output))
+                return f"不完整输出清理失败，文件仍位于: {output}"
+
+            with patch(
+                "batch_logic._cleanup_failed_output",
+                side_effect=fail_cleanup,
+            ):
+                results = run_conversion_batch(
+                    [source],
+                    ".docx",
+                    None,
+                    converter,
+                    threading.Event(),
+                    lambda *_args: None,
+                    lambda _result: None,
+                )
+
+            formal_output = folder / "rejected.docx"
+            self.assertEqual(results[0].status, "failed")
+            self.assertIsNone(results[0].output)
+            self.assertFalse(formal_output.exists())
+            self.assertEqual(len(cleanup_targets), 1)
+            isolated_output = cleanup_targets[0]
+            self.assertEqual(isolated_output.parent, folder)
+            self.assertTrue(isolated_output.name.startswith(".rejected."))
+            self.assertTrue(isolated_output.name.endswith(".partial.docx"))
+            self.assertTrue(isolated_output.exists())
 
     def test_cancel_stops_after_current_item(self):
         with tempfile.TemporaryDirectory() as tmp:

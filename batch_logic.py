@@ -2,10 +2,12 @@
 
 import os
 import threading
+import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence
+from uuid import uuid4
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,77 @@ def resolve_output_path(
         index += 1
 
 
+def _staging_output_path(output_path: Path) -> Path:
+    """Return a private same-directory path that still has the target suffix."""
+
+    output = Path(output_path)
+    return output.with_name(
+        f".{output.stem}.{uuid4().hex}.partial{output.suffix}"
+    )
+
+
+def _cleanup_failed_output(
+    output_path: Path,
+    attempts: int = 3,
+    retry_delay: float = 0.05,
+) -> str:
+    """Remove a rejected output, or isolate it under an unmistakable name."""
+
+    output = Path(output_path)
+    if not output.exists():
+        return ""
+
+    last_error = None
+    for attempt in range(max(1, attempts)):
+        try:
+            output.unlink()
+            return ""
+        except FileNotFoundError:
+            return ""
+        except OSError as exc:
+            last_error = exc
+            if attempt + 1 < max(1, attempts):
+                time.sleep(max(0.0, retry_delay) * (attempt + 1))
+
+    if not output.exists():
+        return ""
+
+    for index in range(1, 1000):
+        suffix = ".failed" if index == 1 else f".failed_{index}"
+        quarantine = output.with_name(output.name + suffix)
+        if quarantine.exists():
+            continue
+        try:
+            output.rename(quarantine)
+        except OSError as exc:
+            last_error = exc
+            break
+        return f"不完整输出无法删除，已隔离为: {quarantine}"
+
+    return (
+        f"不完整输出清理失败，文件仍位于: {output}"
+        + (f" ({last_error})" if last_error else "")
+    )
+
+
+def _publish_staged_output(staging_path: Path, output_path: Path) -> None:
+    """Atomically publish a verified file without overwriting an existing output."""
+
+    staging = Path(staging_path)
+    output = Path(output_path)
+    try:
+        os.link(staging, output)
+    except FileExistsError as exc:
+        raise RuntimeError(f"输出路径在转换期间已被占用: {output}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"无法安全发布转换结果: {output} ({exc})") from exc
+
+    try:
+        staging.unlink()
+    except OSError:
+        _cleanup_failed_output(staging)
+
+
 def run_conversion_batch(
     input_paths: Sequence[Path],
     target_suffix: str,
@@ -97,6 +170,7 @@ def run_conversion_batch(
             continue
 
         output = resolve_output_path(source, target_suffix, output_dir)
+        staging = _staging_output_path(output)
         status_changed(BatchResult(source, output, "running"))
 
         def item_progress(message: str, pct: int, item_index=index) -> None:
@@ -107,19 +181,17 @@ def run_conversion_batch(
         try:
             if not source.is_file():
                 raise FileNotFoundError(f"源文件不存在: {source}")
-            converter(str(source), str(output), item_progress)
-            if not output.is_file():
+            converter(str(source), str(staging), item_progress)
+            if not staging.is_file():
                 raise RuntimeError("转换程序未生成输出文件")
+            _publish_staged_output(staging, output)
             result = BatchResult(source, output, "success")
             progress(index + 1, total, "完成", int(((index + 1) / total) * 100))
         except Exception as exc:
-            if output.exists():
-                try:
-                    output.unlink()
-                except OSError:
-                    pass
-            result = BatchResult(source, output, "failed", str(exc))
-
+            cleanup_message = _cleanup_failed_output(staging)
+            error = str(exc) + (f"\n{cleanup_message}" if cleanup_message else "")
+            # A rejected artifact must never be exposed as a usable output path.
+            result = BatchResult(source, None, "failed", error)
         results.append(result)
         status_changed(result)
 

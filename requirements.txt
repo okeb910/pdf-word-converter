@@ -1,5 +1,6 @@
 PyMuPDF>=1.23.0
 python-docx>=0.8.11
+lxml>=4.9.0
 python-pptx>=1.0.0
 comtypes>=1.2.0; sys_platform == "win32"
 tkinterdnd2>=0.6.2
